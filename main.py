@@ -58,6 +58,11 @@ class SportsAnalyticsHandler(BaseHTTPRequestHandler):
         self.end_headers()
         response_payload = {"status": "success", "analysis": analysis_result}
         self.wfile.write(json.dumps(response_payload).encode('utf-8'))
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Real Harvest System V10.12 - Operativo")
 
 def run(server_class=HTTPServer, handler_class=SportsAnalyticsHandler, port=8080):
     server_address = ('', port)
