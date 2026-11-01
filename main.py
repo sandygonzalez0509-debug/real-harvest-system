@@ -165,3 +165,33 @@ def calcular_clv_y_ev(cuota_tomada, cuota_cierre, prob_modelo):
     
     return clv_porcentaje, ev_matematico
 
+# ==========================================
+# 4. INGESTA HISTÓRICA Y ARRANQUE DEL MOTOR
+# ==========================================
+modelo_entrenado = None
+
+def arrancar_motor_historico(ruta_csv="dataset_historico.csv"):
+    global modelo_entrenado
+    print(f"Iniciando ingesta de datos desde: {ruta_csv}")
+    
+    try:
+        # 1. Leer el historial de partidos (tu mapa de calor)
+        df_historico = pd.read_csv(ruta_csv)
+        
+        # 2. Inyectar las 22 variables (neuromarketing, presión institucional, etc.)
+        df_procesado = estructurar_features(df_historico)
+        
+        # 3. Entrenar el algoritmo con la historia
+        print("Calibrando modelo predictivo para detectar manipulación...")
+        # Asumimos que la columna de victoria real se llama 'resultado_real' en tu CSV
+        modelo_entrenado, _, _ = entrenar_modelo_ev(df_procesado, target='resultado_real')
+        
+        print("✅ Motor histórico calibrado con éxito. Listo para cruzar con datos en vivo.")
+        return True
+        
+    except FileNotFoundError:
+        print("⚠️ ALERTA: Archivo histórico no encontrado. El sistema requiere 'dataset_historico.csv' en la carpeta para aprender.")
+        return False
+    except Exception as e:
+        print(f"⚠️ Fuga detectada en la ingesta: {e}")
+        return False
