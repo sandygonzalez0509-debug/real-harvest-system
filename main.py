@@ -72,3 +72,75 @@ def run(server_class=HTTPServer, handler_class=SportsAnalyticsHandler, port=8080
 
 if __name__ == '__main__':
     run()
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import brier_score_loss, log_loss
+
+# 1. CONSTRUCCIÓN DEL DATAFRAME Y VARIABLES (FEATURE ENGINEERING)
+def estructurar_features(df):
+    """
+    Recibe los datos crudos y calcula las variables de presión, 
+    sesgo arbitral e incentivos comerciales.
+    """
+    # Sesgo y Presión de Masas (Soccernomics & Favoritism Under Social Pressure)
+    df['attendance_ratio'] = df['asistencia_real'] / df['capacidad_estadio']
+    
+    # Incentivos Contractuales (Playing for Keeps)
+    # 1 si es su último año de contrato, 0 si no lo es
+    df['contract_year_flag'] = np.where(df['dias_restantes_contrato'] <= 365, 1, 0)
+    
+    # Presión Institucional en Playoffs (Subperfect Game)
+    # Ejemplo: Si el equipo local va perdiendo la serie, el sistema asigna peso
+    df['extends_series_incentive'] = np.where(
+        (df['juego_de_playoffs'] == 1) & (df['equipo_local_abajo_en_serie'] == 1), 1, 0
+    )
+    
+    # Microestructura del Mercado (Levitt & Paul/Weinbach)
+    # Diferencia entre el % de dinero (handle) y el % de tickets (público)
+    df['sharp_money_divergence'] = df['money_pct'] - df['ticket_pct']
+    
+    # Public Shade: Diferencia entre la cuota de la casa y tu modelo base
+    df['public_shade'] = df['cuota_implícita_casa'] - df['probabilidad_modelo_base']
+    
+    return df
+
+# 2. ENTRENAMIENTO Y CALIBRACIÓN DEL MODELO
+def entrenar_modelo_ev(df, features, target):
+    """
+    Entrena una regresión logística para calibrar la probabilidad real,
+    eliminando las variables que no superan la prueba empírica.
+    """
+    X = df[features]
+    y = df[target] # 1 si el evento/prop ocurrió, 0 si falló
+    
+    # Separación para validar fuera de la muestra
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    modelo = LogisticRegression(max_iter=1000, class_weight='balanced')
+    modelo.fit(X_train, y_train)
+    
+    # Predicción probabilística calibrada
+    probabilidades = modelo.predict_proba(X_test)[:, 1]
+    
+    # Evaluación rigurosa (Superforecasting)
+    brier = brier_score_loss(y_test, probabilidades)
+    print(f"Brier Score (Calibración): {brier:.4f} (Más cerca a 0 es mejor)")
+    
+    return modelo, X_test, probabilidades
+
+# 3. VALIDACIÓN DEFINITIVA: CLOSING LINE VALUE (CLV)
+def calcular_clv_y_ev(cuota_tomada, cuota_cierre, prob_modelo):
+    """
+    Calcula el CLV para medir la eficiencia del sistema y el EV 
+    para proteger el bankroll antes de ejecutar.
+    """
+    # CLV: Si tomaste +150 (2.50) y cierra en +120 (2.20), superaste al mercado
+    clv_porcentaje = (cuota_tomada / cuota_cierre) - 1
+    
+    # Valor Esperado (EV) matemático
+    ev_matematico = (prob_modelo * cuota_tomada) - 1
+    
+    return clv_porcentaje, ev_matematico
+
