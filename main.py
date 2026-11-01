@@ -103,7 +103,28 @@ def estructurar_features(df):
     
     # Public Shade: Diferencia entre la cuota de la casa y tu modelo base
     df['public_shade'] = df['cuota_implícita_casa'] - df['probabilidad_modelo_base']
+        # --- CAPA FINAL: NEUROMARKETING, SESGO Y PROSPECT THEORY (22 Libros) ---
     
+    # 1. Aversión a la pérdida del público (The Undoing Project)
+    # Multiplicador que detecta cuando la masa sobrevalora al favorito por miedo
+    df['loss_aversion_multiplier'] = np.where(
+        (df['cuota_implicita_casa'] > 0.50) & (df['ticket_pct'] > 0.65),
+        2.25 * (df['cuota_implicita_casa'] - 0.50),
+        1.0
+    )
+    
+    # 2. Presión de cumplimiento por patrocinios (Influence & Soccernomics)
+    # Cruza la exposición en horario estelar (Prime Time) con el estatus comercial
+    df['sponsorship_compliance_pressure'] = df['exposicion_nacional_flag'] * df['valor_comercial_atleta']
+    
+    # 3. Fatiga de decisión arbitral (Investigaciones de Sesgo Institucional)
+    # Mide la vulnerabilidad del árbitro ante la presión del estadio en momentos críticos
+    df['referee_decision_fatigue'] = df['faltas_criticas_previas'] * df['attendance_ratio']
+    
+    # 4. Contagio emocional en estadios (Brand Sense & Contagious)
+    # Detecta picos irracionales de dinero impulsados por el ruido mediático
+    df['emotional_contagion_index'] = df['velocidad_menciones_sociales'] / df['promedio_historico_volumen']
+
     return df
 
 # 2. ENTRENAMIENTO Y CALIBRACIÓN DEL MODELO
