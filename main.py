@@ -185,9 +185,20 @@ def american_decimal(odds):
     return Decimal(1) + (x / 100 if x > 0 else Decimal(100) / abs(x))
 
 
+
+
 from math import isfinite
 
-MIN_ROI = 0.00  # Eliminamos el piso artificial para evaluar todo margen de valor real.
+MIN_ROI = 0.25  # Estándar de Francotirador Soberano: Exigimos un 25% de ROI mínimo real, purgando favoritos basura y aislando solo las jugadas de máxima convicción.
+
+def market_math(american_odds: int, estimated_prob: float) -> dict:
+    """Calcula la matemática de mercado y blinda el análisis exigiendo un rendimiento de élite."""
+    try:
+        odds_int = int(american_odds)
+        prob_float = float(estimated_prob) if estimated_prob is not None else 0.5
+        return validate_value(odds_int, prob_float, 0.02, {"odds_valid": True, "context_fresh": True})
+    except (ValueError, TypeError):
+        return {"decision": "NO_OPERAR", "reason": "MARKET_MATH_PARSING_FAILURE"}
 
 def validate_value(american_odds: int, probability: float, uncertainty_margin: float, flags: dict) -> dict:
     if not all(flags.values()):
@@ -204,13 +215,14 @@ def validate_value(american_odds: int, probability: float, uncertainty_margin: f
         expected_roi = conservative_p * decimal_odds - 1
         
         return {
-            "decision": "CANDIDATO" if expected_roi > MIN_ROI else "NO_OPERAR",
+            "decision": "CANDIDATO" if expected_roi >= MIN_ROI else "NO_OPERAR",
             "conservative_probability": conservative_p,
             "implied_probability": 1 / decimal_odds,
             "expected_roi": expected_roi
         }
     except (ValueError, TypeError, OverflowError):
         return {"decision": "NO_OPERAR", "reason": "MATH_EXECUTION_FAILURE"}
+
 
 
 SYSTEM = """You are the Real Harvest V10.12 quantitative sports analysis engine.
