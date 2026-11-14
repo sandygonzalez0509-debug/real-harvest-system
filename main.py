@@ -191,12 +191,12 @@ from math import isfinite
 
 MIN_ROI = 0.25  # Estándar de Francotirador Soberano: Exigimos un 25% de ROI mínimo real, purgando favoritos basura y aislando solo las jugadas de máxima convicción.
 
-def market_math(american_odds: int, estimated_prob: float) -> dict:
+def market_math(american_odds: int, estimated_prob: float, dynamic_margin: float = 0.02) -> dict:
     """Calcula la matemática de mercado y blinda el análisis exigiendo un rendimiento de élite."""
     try:
         odds_int = int(american_odds)
         prob_float = float(estimated_prob) if estimated_prob is not None else 0.5
-        return validate_value(odds_int, prob_float, 0.02, {"odds_valid": True, "context_fresh": True})
+        return validate_value(odds_int, prob_float, dynamic_margin, {"odds_valid": True, "context_fresh": True})
     except (ValueError, TypeError):
         return {"decision": "NO_OPERAR", "reason": "MARKET_MATH_PARSING_FAILURE"}
 
@@ -263,10 +263,11 @@ DIRECTRIZ DE TRAZABILIDAD ABSOLUTA Y EXTRACCIÓN DE VALOR:
 4. EXPANSIÓN DE SOBERANÍA: Si detectas que el tablero exige mayor precisión y nos falta un modelo estadístico, documento o libro para extraer la cuota con máximo valor, notifícalo de inmediato solicitando la programación de ese nuevo recurso.
 """
 
-
 def analyze(payload):
     game = payload.get("game")
     odds = payload.get("odds", {})
+    dynamic_margin = float(payload.get("uncertainty_margin", 0.02))
+    
     if not isinstance(game, str) or not game.strip() or len(game) > 300:
         raise ValueError("Valid game required")
     if not isinstance(odds, dict) or not odds or len(odds) > 100:
@@ -274,7 +275,9 @@ def analyze(payload):
     estimates = payload.get("estimated_probabilities", {})
     if not isinstance(estimates, dict):
         raise ValueError("estimated_probabilities must be an object")
-    market = {str(k): market_math(v, estimates.get(k)) for k, v in odds.items()}
+        
+    market = {str(k): market_math(v, estimates.get(k), dynamic_margin) for k, v in odds.items()}
+
     context = retrieve(game + " " + json.dumps(odds, ensure_ascii=False), top_k=6)
     context_text = "\n\n".join(
         f"SOURCE: {item['source']}\n{item['text'][:1500]}" for item in context
@@ -328,7 +331,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(401, {"error": "Unauthorized"})
             return
         path = urlsplit(self.path).path
-        if path not in ("/ingest", "/analyze", "/retrieve"):
+               if path not in ("/ingest", "/analyze", "/retrieve", "/audit"):
+
             self.send_json(404, {"error": "Not found"})
             return
         try:
@@ -343,9 +347,20 @@ class Handler(BaseHTTPRequestHandler):
                 result = ingest_text(payload.get("text"), payload.get("source", "master_protocol.txt"))
             elif path == "/retrieve":
                 result = {"matches": retrieve(payload.get("query"), payload.get("top_k", 6))}
-            else:
+                        self.send_json(200, result)
+
+          
+            elif path == "/audit":
+                auditor = AuditorEcosistemaElite()
+                result = auditor.auditar_historial(payload.get("registros", []))
+                self.send_json(200, result)
+            elif path == "/analyze":
                 result = analyze(payload)
-            self.send_json(200, result)
+                self.send_json(200, result)
+            else:
+                result = {"matches": retrieve(payload.get("query"), payload.get("top_k", 6))}
+                self.send_json(200, result)
+
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": mask_secrets(str(exc))})
         except IntegrationError as exc:
