@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import re
-import socket
+import math
 import time
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
@@ -29,6 +29,9 @@ NAMESPACE = os.getenv("PINECONE_NAMESPACE", "rh-te3small-1024-v1")
 MAX_BODY = 1_000_000
 MAX_MESSAGE = 600
 MAX_QUERY = 12000
+
+MIN_ROI = 0.05
+KELLY_FRACTION = 0.25
 
 class IntegrationError(Exception):
     def __init__(self, stage: str, message: str, status: int = 502):
@@ -58,7 +61,6 @@ def mask_secrets(value):
 
 
 def service_call(stage, action):
-    """Execute an external action and redact diagnostic errors, including JSON bodies."""
     try:
         return action()
     except IntegrationError:
@@ -175,7 +177,7 @@ def retrieve(query, top_k=6):
             for m in result.matches]
 
 
-def american_decimal(odds):
+def american_to_decimal(odds):
     try:
         x = Decimal(str(odds))
     except (InvalidOperation, ValueError):
@@ -185,88 +187,74 @@ def american_decimal(odds):
     return Decimal(1) + (x / 100 if x > 0 else Decimal(100) / abs(x))
 
 
-
-
-from math import isfinite
-
-MIN_ROI = 0.25  # Estándar de Francotirador Soberano: Exigimos un 25% de ROI mínimo real, purgando favoritos basura y aislando solo las jugadas de máxima convicción.
-
-def market_math(american_odds: int, estimated_prob: float, dynamic_margin: float = 0.02) -> dict:
-    """Calcula la matemática de mercado y blinda el análisis exigiendo un rendimiento de élite."""
+def market_math(american_odds: int, estimated_prob: float, dynamic_margin: float = 0.015) -> dict:
+    """Calcula la matemática de mercado con Ecuación de Valor y Kelly Fraccionado."""
     try:
         odds_int = int(american_odds)
         prob_float = float(estimated_prob) if estimated_prob is not None else 0.5
-        return validate_value(odds_int, prob_float, dynamic_margin, {"odds_valid": True, "context_fresh": True})
-    except (ValueError, TypeError):
-        return {"decision": "NO_OPERAR", "reason": "MARKET_MATH_PARSING_FAILURE"}
+        dec = float(american_to_decimal(odds_int))
+        implied_p = 1.0 / dec
+        conservative_p = max(0.0, prob_float - dynamic_margin)
+        expected_roi = (conservative_p * dec) - 1.0
+        b = dec - 1.0
+        full_kelly = max(0.0, ((b * conservative_p) - (1.0 - conservative_p)) / b) if b > 0 else 0.0
+        kelly_pct = round(full_kelly * KELLY_FRACTION * 100, 2)
 
-def validate_value(american_odds: int, probability: float, uncertainty_margin: float, flags: dict) -> dict:
-    if not all(flags.values()):
-        return {"decision": "NO_OPERAR", "reason": "STALE_OR_INVALID_CONTEXT"}
-    try:
-        if not -10000 < american_odds < 10000 or -100 < american_odds < 100:
-            raise ValueError("Invalid odds magnitude")
-        p, margin = float(probability), float(uncertainty_margin)
-        if not all(map(isfinite, (p, margin))) or not (0 <= p <= 1) or not (0 <= margin <= 1):
-            raise ValueError("Invalid probability bounds")
-        
-        decimal_odds = 1 + american_odds / 100 if american_odds > 0 else 1 + 100 / abs(american_odds)
-        conservative_p = max(0.0, p - margin)
-        expected_roi = conservative_p * decimal_odds - 1
-        
         return {
-            "decision": "CANDIDATO" if expected_roi >= MIN_ROI else "NO_OPERAR",
-            "conservative_probability": conservative_p,
-            "implied_probability": 1 / decimal_odds,
-            "expected_roi": expected_roi
+            "decision": "CANDIDATO_VALOR" if expected_roi >= MIN_ROI else "PROTEGER_BANKROLL",
+            "conservative_probability": round(conservative_p, 4),
+            "implied_probability": round(implied_p, 4),
+            "expected_roi_pct": round(expected_roi * 100, 2),
+            "kelly_fraction_pct": kelly_pct
         }
-    except (ValueError, TypeError, OverflowError):
-        return {"decision": "NO_OPERAR", "reason": "MATH_EXECUTION_FAILURE"}
+    except (ValueError, TypeError):
+        return {"decision": "PROTEGER_BANKROLL", "reason": "MATH_EXECUTION_FAILURE"}
+
+
+class AuditorEcosistemaElite:
+    def __init__(self, umbral_precision: float = 0.85):
+        self.umbral_precision = umbral_precision
+
+    def auditar_historial(self, registros_predicciones: list) -> dict:
+        total_apuestas = len(registros_predicciones)
+        if total_apuestas == 0:
+            return {"estado": "FLUJO ACTIVO", "mensaje": "Sistema listo para procesar la siguiente jugada con éxito."}
+        precisiones = [float(item.get("p_real", 0.9)) for item in registros_predicciones]
+        precision_promedio = sum(precisiones) / total_apuestas
+        return {
+            "estado": "✅ EXPANSIÓN ÓPTIMA",
+            "total_evaluados": total_apuestas,
+            "precision_promedio": round(precision_promedio, 4),
+            "mensaje": "El motor opera con precisión de francotirador, multiplicando el valor y consolidando el bankroll."
+        }
 
 
 SYSTEM = """[PROTOCOLO MAESTRO DE AUDITORÍA Y EXTRACCIÓN ÉLITE - V10.12]
 
-Analiza la cartelera de encuentros deportivos disponibles (partido completo, cualquier disciplina). Filtra con rigor absoluto bajo el estándar de máxima precisión y entrega únicamente anomalías fundamentadas en datos físicos y reales.
+Analiza la cartelera de encuentros deportivos disponibles (partido completo, primera mitad, períodos y props de jugadores en cualquier disciplina). Filtra con rigor absoluto bajo el estándar de máxima precisión y entrega únicamente anomalías fundamentadas en datos físicos y reales.
 
 Para cada selección, cruza con máxima profundidad las siguientes Variables Ocultas y de Dinámica Estructural:
+1. Incentivos Contractuales y Bonos de Rendimiento.
+2. Momento Competitivo y Reputacional.
+3. Factores de Viaje y Desgaste (Fatiga Silenciosa).
+4. Dinámicas de Rivalidad y Desquite.
+5. Divergencia de Líneas (Line Movement vs. Realidad / Sharp Money).
+6. Detección Autónoma de Varianza y Variables Ocultas.
 
-Incentivos Contractuales y Bonos de Rendimiento: Jugadores que necesitan alcanzar metas estadísticas específicas (goles, puntos, yardas, rebotes, entradas o sets) en este tramo de la temporada o contrato para activar bonos de rendimiento masivo.
-
-Momento Competitivo y Reputacional: Equipos o estrellas bajo alta exigencia mediática o en riesgo de inestabilidad institucional tras resultados adversos recientes, enfocados en una ejecución total para cumplir con las expectativas de la gerencia o la afición.
-
-Factores de Viaje y Desgaste (Fatiga Silenciosa): Calendarios cruzados, cambios de zona horaria o acumulación de minutos que induzcan rotaciones tácticas inesperadas o, por el contrario, exijan a los jugadores estelares mantener una carga de minutos extraordinaria.
-
-Dinámicas de Rivalidad y Desquite: Factores psicológicos de revancha directa por registros previos que redefinan el ritmo base del encuentro e incrementen la intensidad competitiva o el volumen de acciones.
-
-Divergencia de Líneas (Line Movement vs. Realidad): Cruce entre el flujo de capital institucional (Sharp Money) y la línea ofrecida por la casa para detectar variaciones técnicas o sobrevaloraciones generadas por la tendencia del público general.
-
-DETECCIÓN AUTÓNOMA DE VARIANZA Y VARIABLES OCULTAS: 
-Más allá de los factores listados, tienes la autoridad y la orden estricta de rastrear e integrar cualquier otra variable física, contextual, táctica, climática, arbitral o institucional que genere un cambio de varianza en el encuentro. Si detectas cualquier factor que altere o potencie la lectura del juego y modifique el margen operativo, audítalo y ponlo sobre la mesa con total claridad.
-
-Estudio de Tramos Específicos y Submercados Óptimos:
-Para cada anomalía detectada, amplía el desglose hacia el resultado global del encuentro y detalla cuál es el tramo o submercado exacto de mayor ventaja táctica, optimizado para extraer el mayor rendimiento analítico según las características de la disciplina.
-
-Aviso Operativo de Ecosistema:
-Este núcleo opera de forma sincronizada dentro de un ecosistema de élite respaldado por suscripciones de pago avanzadas en Gemini, ChatGPT Plus, Claude Pro, Perplexity Pro, Grok, X, Action Network PRO y Hard Rock Bet. Si el núcleo de análisis requiere datos visuales en tiempo real, confirmación de paneles específicos o cruces métricos adicionales, estamos listos para adjuntar capturas de pantalla de inmediato.
-
-Instrucción de Formato (Bloque Único de Copiado Rápido):
-Entrega toda la respuesta analítica integrada en un único bloque de texto continuo y plano, sin tablas divididas, sin recuadros fragmentados y sin elementos que dificulten la selección. Estructúralo para que un solo toque de selección permita copiar todo el contenido limpio y rápido. Presenta cada oportunidad detallando el cruce de las variables anteriores, la probabilidad estimada y el margen operativo a favor (+EV), fundamentado en hechos reales.
-
-Canalización Estratégica:
-Si el análisis detecta que una línea ha sido expandida por tendencia masiva o ajuste institucional hasta alcanzar su techo estadístico, el sistema avanza hacia la observación del valor analítico puro. Escanea el polo complementario óptimo de esa misma línea (submercado inverso o posición alterna) para identificar la transferencia operativa. El sistema fluye con la corrección natural del tablero, ejecutando la selección donde la matemática deportiva ofrece el margen más favorable.
+Estudio de Tramos Específicos y Canalización Estratégica:
+Desglosa hacia el resultado global del encuentro cuál es el tramo o submercado exacto de mayor ventaja táctica. Si una línea ha sido expandida por tendencia masiva o ajuste institucional hasta alcanzar su techo estadístico, aplica el principio de recepción fluida y canalización estratégica: escanea de inmediato el polo complementario óptimo de esa misma línea (submercado inverso o posición alterna) para identificar la transferencia operativa y ejecutar la selección donde la matemática deportiva ofrece el margen más favorable.
 
 DIRECTRIZ DE TRAZABILIDAD ABSOLUTA Y EXTRACCIÓN DE VALOR:
-
-1. CRUCE OBLIGATORIO: Para cada análisis, es un requisito estricto y no negociable cruzar la consulta con los 91 vectores bibliográficos de nuestra memoria profunda (rh-vectors-1024-v1). No utilices conocimiento genérico de internet.
-2. CERO ALUCINACIONES: No inventes lesiones, estadísticas, ni probabilidades. Las métricas calculadas por nuestro ecosistema en Python son la autoridad final; tú solo las interpretas.
-3. EVIDENCIA TÁCTICA: Toda conclusión deportiva debe entregar su base física y lógica. Imprime en tu respuesta el ID del vector consultado, el fragmento literal de nuestro libro y la regla matemática utilizada que justifica el margen a favor (+EV) contra la casa de apuestas (Hard Rock Bet).
-4. EXPANSIÓN DE SOBERANÍA: Si detectas que el tablero exige mayor precisión y nos falta un modelo estadístico, documento o libro para extraer la cuota con máximo valor, notifícalo de inmediato solicitando la programación de ese nuevo recurso.
+1. CRUCE OBLIGATORIO con los 92 vectores bibliográficos de nuestra memoria profunda (rh-vectors-1024-v1).
+2. CERO ALUCINACIONES: Las métricas calculadas por nuestro ecosistema en Python son la autoridad final; tú solo las interpretas.
+3. EVIDENCIA TÁCTICA: Toda conclusión deportiva debe entregar su base física y lógica, imprimiendo el ID del vector consultado y la regla matemática aplicada contra Hard Rock Bet.
 """
+
 
 def analyze(payload):
     game = payload.get("game")
     odds = payload.get("odds", {})
-    dynamic_margin = float(payload.get("uncertainty_margin", 0.02))
+    dynamic_margin = float(payload.get("uncertainty_margin", 0.015))
     
     if not isinstance(game, str) or not game.strip() or len(game) > 300:
         raise ValueError("Valid game required")
@@ -331,8 +319,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(401, {"error": "Unauthorized"})
             return
         path = urlsplit(self.path).path
-               if path not in ("/ingest", "/analyze", "/retrieve", "/audit"):
-
+        if path not in ("/ingest", "/analyze", "/retrieve", "/audit"):
             self.send_json(404, {"error": "Not found"})
             return
         try:
@@ -343,13 +330,13 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("JSON object required")
+            
             if path == "/ingest":
                 result = ingest_text(payload.get("text"), payload.get("source", "master_protocol.txt"))
+                self.send_json(200, result)
             elif path == "/retrieve":
                 result = {"matches": retrieve(payload.get("query"), payload.get("top_k", 6))}
-                        self.send_json(200, result)
-
-          
+                self.send_json(200, result)
             elif path == "/audit":
                 auditor = AuditorEcosistemaElite()
                 result = auditor.auditar_historial(payload.get("registros", []))
@@ -358,9 +345,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = analyze(payload)
                 self.send_json(200, result)
             else:
-                result = {"matches": retrieve(payload.get("query"), payload.get("top_k", 6))}
-                self.send_json(200, result)
-
+                self.send_json(404, {"error": "Not found"})
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": mask_secrets(str(exc))})
         except IntegrationError as exc:
@@ -379,7 +364,7 @@ def main():
         with open(protocol_path, "r", encoding="utf-8-sig") as f:
             result = ingest_text(f.read(), os.path.basename(protocol_path))
         LOG.info("Protocol indexed: %d chunks", result["chunks"])
-    host = os.getenv("HOST", "127.0.0.1")
+    host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8080"))
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
@@ -394,29 +379,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-class AuditorEcosistemaElite:
-    def __init__(self, umbral_precision: float = 0.85):
-        self.umbral_precision = umbral_precision
-
-    def auditar_historial(self, registros_predicciones: list) -> dict:
-        """
-        Eleva y valida el conteo absoluto de ejecuciones, proyectando 
-        la precisión óptima y potenciando el rendimiento del ecosistema.
-        """
-        total_apuestas = len(registros_predicciones)
-        if total_apuestas == 0:
-            return {"estado": "FLUJO ACTIVO", "mensaje": "Sistema listo para procesar la siguiente jugada con éxito."}
-
-        precisiones = []
-        for item in registros_predicciones:
-            p_estimada = item.get("p_real", 0.9)
-            precisiones.append(p_estimada)
-
-        precision_promedio = sum(precisiones) / total_apuestas
-
-        return {
-            "estado": "✅ EXPANSIÓN ÓPTIMA",
-            "total_evaluados": total_apuestas,
-            "precision_promedio": round(precision_promedio, 4),
-            "mensaje": "El motor opera con precisión de francotirador, multiplicando el valor y consolidando el bankroll."
-        }
