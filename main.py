@@ -30,7 +30,7 @@ TARGET_BOOKS   = [b.strip() for b in os.getenv("TARGET_BOOKS", "hardrockbet_fl,h
 SHARP_BOOKS    = [b.strip() for b in os.getenv("SHARP_BOOKS", "pinnacle").split(",") if b.strip()]
 REF_BOOKS      = [b.strip() for b in os.getenv("REF_BOOKS", "draftkings,fanduel,betmgm,williamhill_us,betrivers,espnbet").split(",") if b.strip()]
 
-MIN_ROI        = float(os.getenv("MIN_ROI", "0.18"))         # +18% ROI obligatorio
+MIN_ROI        = float(os.getenv("MIN_ROI", "0.035"))        # +3.5% ROI obligatorio
 NEAR_MISS_ROI  = float(os.getenv("NEAR_MISS_ROI", "0.03"))   # Registro de auditoría desde +3%
 SUSPECT_ROI    = float(os.getenv("SUSPECT_ROI", "0.45"))     # Alerta de posible cuota colgada
 MIN_REF_BOOKS  = int(os.getenv("MIN_REF_BOOKS", "3"))
@@ -214,7 +214,7 @@ def scan_event(sport: str, ev: dict, now_utc: datetime):
                 "cuota_dec": round(O, 4),
                 "p_imp": round(1.0 / O, 4),
                 "p_ref": round(p_est, 4),
-                "p_req_18": round(p_req, 4),
+                "p_req_min": round(p_req, 4),
                 "roi": round(roi, 4),
                 "fuente": source,
                 "n_casas": n_refs,
@@ -247,7 +247,7 @@ def scan_event(sport: str, ev: dict, now_utc: datetime):
                 f"<b>{row['juego']}</b> ({sport})\n"
                 f"• Mercado: {mkey.upper()} → <b>{o['name']}{linea_str}</b>\n"
                 f"• Ejecución: <b>{target_key}</b> @ <b>{O:.2f}</b> (hace {age_t}s)\n"
-                f"• p_ref: <b>{p_est:.1%}</b> ({source}, {n_refs}) | p_req(+18%): <b>{p_req:.1%}</b>\n"
+                f"• p_ref: <b>{p_est:.1%}</b> ({source}, {n_refs}) | p_req({MIN_ROI:+.1%}): <b>{p_req:.1%}</b>\n"
                 f"• ROI estimado: <b>{roi:+.1%}</b>\n"
                 f"• Stake máx (0.25x Kelly): <b>{stake_f:.2%}</b>{monto_str}{nota_txt}"
             )
@@ -257,7 +257,7 @@ def scan_event(sport: str, ev: dict, now_utc: datetime):
 def scanner_loop():
     send_telegram(
         f"🚀 <b>Real Harvest Radar V3.1</b> activo\n"
-        f"Objetivo: Hard Rock FL | Filtro: ROI ≥ <b>{MIN_ROI:.0%}</b> | Tope: <b>{MAX_STAKE_PCT:.0%}</b>"
+        f"Objetivo: Hard Rock FL | Filtro: ROI ≥ <b>{MIN_ROI:.1%}</b> | Tope: <b>{MAX_STAKE_PCT:.0%}</b>"
     )
     while True:
         if not ODDS_API_KEY:
