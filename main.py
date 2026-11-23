@@ -235,6 +235,7 @@ def scan_event(sport: str, ev: dict, now_utc: datetime):
             SENT_CACHE[sig] = O
 
             linea_str = f" {o['point']:+g}" if o.get("point") is not None else ""
+            cuota_am = f"+{round((O - 1) * 100)}" if O >= 2.0 else f"{round(-100 / (O - 1))}"
             monto_str = f" (${BANKROLL * stake_f:,.2f})" if BANKROLL > 0 else ""
             notas = []
             if is_push_line:
@@ -247,11 +248,13 @@ def scan_event(sport: str, ev: dict, now_utc: datetime):
                 f"🌾 <b>REAL HARVEST V3.1 — CANDIDATO +EV</b>\n"
                 f"<b>{row['juego']}</b> ({sport})\n"
                 f"• Mercado: {mkey.upper()} → <b>{o['name']}{linea_str}</b>\n"
-                f"• Ejecución: <b>{target_key}</b> @ <b>{O:.2f}</b> (hace {age_t}s)\n"
+                f"• Ejecución: <b>{target_key}</b> @ <b>{cuota_am}</b> (hace {age_t}s)\n"
                 f"• p_ref: <b>{p_est:.1%}</b> ({source}, {n_refs}) | p_req({MIN_ROI:+.1%}): <b>{p_req:.1%}</b>\n"
                 f"• ROI estimado: <b>{roi:+.1%}</b>\n"
                 f"• Stake máx (0.25x Kelly): <b>{stake_f:.2%}</b>{monto_str}{nota_txt}"
             )
+
+            
             STATE["alerts_sent"] += 1
 
 
