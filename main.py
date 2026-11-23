@@ -20,7 +20,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 PORT               = int(os.getenv("PORT", "10000"))
 
-SPORTS         = [s.strip() for s in os.getenv("SPORTS", "basketball_nba,americanfootball_nfl,basketball_ncaab").split(",") if s.strip()]
+SPORTS= [s.strip() for s in os.getenv("SPORTS", "basketball_nba,americanfootball_nfl,basketball_ncaab,icehockey_nhl,americanfootball_ncaaf,basketball_ncaaw,soccer_epl,soccer_spain_la_liga,soccer_italy_serie_a,soccer_uefa_champs_league").split(",") if s.strip()]
+
 MARKETS        = os.getenv("MARKETS", "h2h,spreads,totals")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "900"))   # 15 min base
 HOURS_AHEAD    = int(os.getenv("HOURS_AHEAD", "24"))       # Solo eventos próximas 24h
