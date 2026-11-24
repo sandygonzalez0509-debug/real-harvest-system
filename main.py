@@ -1,14 +1,20 @@
 """
-Real Harvest Radar V3.2 ÉLITE — Motor +EV / ROI para Hard Rock Bet (Florida)
-Síntesis Maestra:
-  - De-vig Power Method exacto + validación estructural completa de mercado y overround
-  - Reloj fresco por deporte + sincronización de snapshots (anti-reverse steam)
-  - Consenso normalizado (suma 1.0) + blindaje dispersión y brecha Pinnacle vs consenso
-  - Matemática exacta de Push (ROI y p_req reales + Kelly condicional exacto) + filtro líneas cuarto
-  - Visibilidad total desde +3.5% hasta máximos (+10% Alto, +18%+ Élite) + alerta de correlación intra-partido
-  - Máximo ahorro de créditos The Odds API v4 (/sports y /events gratis, frecuencia inteligente, presupuesto previo)
-  - Robustez 24/7 en Render: confirmación Telegram antes de deduplicar, re-alerta inteligente, HTML seguro,
-    CSV con validación de esquema/rotación, ThreadingHTTPServer con heartbeat watchdog y cierre limpio SIGTERM.
+Real Harvest Radar V3.3 ÉLITE — Motor +EV / ROI para Hard Rock Bet (Florida)
+Evolución V3.3 (Costo $0 extra en API):
+  1. Modo Turbo en Horas Pico (Calendario Inteligente ET):
+     - Escanea cada 8 min en horas pico de reportes de lesiones/alineaciones SOLO deportes con juegos <= 3.5h
+     - Mantiene 30 min en horario normal y 90 min en madrugada (ahorro de créditos inteligente)
+  2. Interpolación de Medios Puntos (Alt-Line Pricing):
+     - Calcula probabilidad justa exacta con distribución Normal calibrada por deporte (NBA, NCAAB, NCAAW, NFL, NCAAF)
+     - Captura desfases de 0.5 a 3.5 pts cuando el mercado sharp se mueve y Hard Rock Bet queda rezagado
+     - Guardia automática en números clave de NFL/NCAAF (3 y 7) y exclusión de deportes de goles (NHL/Fútbol)
+  3. Visualización Limpia de Insignias en Telegram:
+     - Muestra exclusivamente las insignias activas encontradas en cada ciclo (🌾, ⚡ o 🔥)
+     - El Máximo del ciclo lleva la insignia exacta del escalón alcanzado
+  4. Núcleo V3.2 ÉLITE intacto:
+     - De-vig Power Method + Escuadra Multi-Sharp + Consenso normalizado (suma 1.0)
+     - Reloj fresco por deporte + sincronización de snapshots + matemática exacta de Push
+     - Pre-filtro gratuito (/sports y /events) + confirmación real Telegram + Health Watchdog 24/7
 """
 import os
 import json
@@ -26,6 +32,12 @@ import urllib.parse
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    from zoneinfo import ZoneInfo
+    ET_TZ = ZoneInfo("America/New_York")
+except Exception:
+    ET_TZ = timezone(timedelta(hours=-5))
 
 # --- CONFIGURACIÓN Y SECRETOS (Render Environment Variables) ---
 ODDS_API_KEY       = os.getenv("ODDS_API_KEY")
@@ -46,34 +58,57 @@ SPORTS = [
 ]
 
 MARKETS          = os.getenv("MARKETS", "h2h,spreads,totals")
-CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "1800"))    # 30 min alineado con Render Pro
+CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "1800"))    # 30 min horario normal
+PEAK_INTERVAL    = int(os.getenv("PEAK_INTERVAL", "480"))      # 8 min Modo Turbo (horas pico)
+QUIET_INTERVAL   = int(os.getenv("QUIET_INTERVAL", "5400"))    # 90 min madrugada (ahorro créditos)
+TURBO_MODE       = os.getenv("TURBO_MODE", "true").lower() == "true"
+TURBO_HORIZON_H  = float(os.getenv("TURBO_HORIZON_H", "3.5"))  # Turbo aplica si próximo juego <= 3.5h
+PEAK_START_ET    = float(os.getenv("PEAK_START_ET", "16.0"))   # L-V 4:00 PM ET
+PEAK_END_ET      = float(os.getenv("PEAK_END_ET", "21.5"))     # L-D 9:30 PM ET
+WKND_PEAK_START  = float(os.getenv("WKND_PEAK_START", "11.0")) # S-D 11:00 AM ET (NFL/NCAAF/NCAAB/EPL)
+QUIET_START_ET   = float(os.getenv("QUIET_START_ET", "0.5"))   # 12:30 AM ET
+QUIET_END_ET     = float(os.getenv("QUIET_END_ET", "9.0"))     # 9:00 AM ET
+
 HOURS_AHEAD      = int(os.getenv("HOURS_AHEAD", "24"))         # Eventos próximas 24h
 MAX_AGE_SEC      = int(os.getenv("MAX_AGE_SEC", "300"))        # Máx 5 min antigüedad cuota
 MAX_SKEW_SEC     = int(os.getenv("MAX_SKEW_SEC", "120"))       # Desfase máx entre HRB y referencia
 SMART_SCHEDULING = os.getenv("SMART_SCHEDULING", "true").lower() == "true"
 
 TARGET_BOOKS = [b.strip() for b in os.getenv("TARGET_BOOKS", "hardrockbet_fl,hardrockbet").split(",") if b.strip()]
-SHARP_BOOKS  = [b.strip() for b in os.getenv("SHARP_BOOKS", "pinnacle").split(",") if b.strip()]
-REF_BOOKS    = [b.strip() for b in os.getenv("REF_BOOKS", "draftkings,fanduel,betmgm,williamhill_us,betrivers,espnbet").split(",") if b.strip()]
+SHARP_BOOKS  = [b.strip() for b in os.getenv("SHARP_BOOKS", "pinnacle,lowvig,betonlineag,betfair_ex_eu").split(",") if b.strip()]
+REF_BOOKS    = [b.strip() for b in os.getenv("REF_BOOKS", "draftkings,fanduel,betmgm,williamhill_us").split(",") if b.strip()]
 
 # --- UMBRALES +EV Y ESCALONES ---
 MIN_ROI       = float(os.getenv("MIN_ROI", "0.035"))        # +3.5% ROI obligatorio (piso)
 HIGH_ROI      = float(os.getenv("HIGH_ROI", "0.10"))        # +10.0% escalón alto
-ELITE_ROI     = float(os.getenv("ELITE_ROI", "0.18"))       # +18.0% escalón élite
+ELITE_ROI     = float(os.getenv("ELITE_ROI", "0.18"))       # +18.0% escalón élite (abierto hacia arriba)
 NEAR_MISS_ROI = float(os.getenv("NEAR_MISS_ROI", "0.03"))   # Registro auditoría desde +3.0%
 SUSPECT_ROI   = float(os.getenv("SUSPECT_ROI", "0.45"))     # Advertencia de posible cuota colgada
 
-# --- DE-VIG, BLINDAJE Y GESTIÓN DE RIESGO ---
+# --- DE-VIG, ALT-LINE PRICING Y GESTIÓN DE RIESGO ---
 DEVIG_METHOD     = os.getenv("DEVIG_METHOD", "power").lower()     # power | multiplicative
 MIN_OVERROUND    = float(os.getenv("MIN_OVERROUND", "1.0"))       # Rechaza mercados incompletos/arbitraje interno
 MAX_OVERROUND    = float(os.getenv("MAX_OVERROUND", "1.15"))      # Rechaza casas con vig excesivo
 MIN_REF_BOOKS    = int(os.getenv("MIN_REF_BOOKS", "3"))
 MAX_REF_SPREAD   = float(os.getenv("MAX_REF_SPREAD", "0.035"))    # Dispersión máx entre casas consenso
-MAX_SHARP_GAP    = float(os.getenv("MAX_SHARP_GAP", "0.04"))      # Choque máx Pinnacle vs consenso
-MAX_DEC_ODDS     = float(os.getenv("MAX_DEC_ODDS", "0"))          # 0 = ver todo; ej. 6.0 bloquea alertas > +500
+MAX_SHARP_GAP    = float(os.getenv("MAX_SHARP_GAP", "0.04"))      # Choque máx Sharp vs consenso
+MAX_DEC_ODDS     = float(os.getenv("MAX_DEC_ODDS", "0"))          # 0 = espectro abierto; ej. 6.0 bloquea > +500
 LONGSHOT_ODDS    = float(os.getenv("LONGSHOT_ODDS", "6.0"))       # Desde +500 aplica etiqueta varianza + Kelly reducido
 LONGSHOT_KELLY   = float(os.getenv("LONGSHOT_KELLY", "0.5"))      # Factor Kelly en cuotas largas (>= +500)
-CONSENSUS_KELLY  = float(os.getenv("CONSENSUS_KELLY", "0.5"))     # Factor Kelly cuando falta Pinnacle
+CONSENSUS_KELLY  = float(os.getenv("CONSENSUS_KELLY", "0.5"))     # Factor Kelly cuando falta referencia Sharp
+
+ALT_LINE_ENABLED = os.getenv("ALT_LINE_ENABLED", "true").lower() == "true"
+ALT_LINE_KELLY   = float(os.getenv("ALT_LINE_KELLY", "0.70"))     # Factor Kelly prudente en líneas interpoladas
+
+# Parámetros calibrados de desviación estándar (sigma conservadora) y salto máximo permitido por deporte
+ALT_LINE_PARAMS = {
+    "basketball_nba":          {"spreads": (12.5, 3.5), "totals": (18.5, 4.5)},
+    "basketball_ncaab":        {"spreads": (11.8, 3.5), "totals": (16.0, 4.5)},
+    "basketball_ncaaw":        {"spreads": (12.2, 3.5), "totals": (16.0, 4.5)},
+    "americanfootball_nfl":    {"spreads": (13.8, 1.5), "totals": (13.8, 2.0)},
+    "americanfootball_ncaaf":  {"spreads": (15.8, 1.5), "totals": (16.5, 2.5)},
+}
+FOOTBALL_KEY_NUMBERS = (3.0, 7.0)
 
 PUSH_PROB_SPREAD = float(os.getenv("PUSH_PROB_SPREAD", "0.045"))  # Estimación empírica push en spreads enteros
 PUSH_PROB_TOTAL  = float(os.getenv("PUSH_PROB_TOTAL", "0.040"))   # Estimación empírica push en totales enteros
@@ -88,19 +123,21 @@ MAX_TOTAL_PCT  = float(os.getenv("MAX_TOTAL_PCT", "0.10"))        # Guía máx 1
 MIN_CREDITS         = int(os.getenv("MIN_CREDITS", "50"))
 DAILY_CREDIT_BUDGET = int(os.getenv("DAILY_CREDIT_BUDGET", "0"))  # 0 = sin tope diario extra
 ALERT_TTL_SEC       = int(os.getenv("ALERT_TTL_SEC", "3600"))     # Re-alerta tras 1h si sigue +EV
-REALERT_ROI_DELTA   = float(os.getenv("REALERT_ROI_DELTA", "0.02"))  # Re-alerta si ROI sube >= +2.0%
-WATCHDOG_SEC        = int(os.getenv("WATCHDOG_SEC", str(max(900, CHECK_INTERVAL * 3))))
-LOG_FILE            = os.getenv("LOG_FILE", "senales_v32.csv")
+REALERT_ROI_DELTA   = float(os.getenv("REALERT_ROI_DELTA", "0.02"))
+WATCHDOG_SEC        = int(os.getenv("WATCHDOG_SEC", "900"))       # Heartbeat corre cada <=10s durante esperas
+LOG_FILE            = os.getenv("LOG_FILE", "senales_v33.csv")
 MAX_LOG_BYTES       = int(os.getenv("MAX_LOG_BYTES", "50000000"))
 
 STATE = {
     "status": "running",
-    "version": "V3.2-ELITE",
+    "version": "V3.3-ELITE-TURBO",
+    "schedule_mode": "INIT",
     "last_scan_utc": None,
     "credits_left": None,
     "credits_last": None,
     "daily_credits_spent": 0,
     "alerts_sent": 0,
+    "alt_line_alerts": 0,
     "near_misses": 0,
     "stale_rejected": 0,
     "skew_rejected": 0,
@@ -125,6 +162,9 @@ STOP           = threading.Event()
 CSV_LOCK       = threading.Lock()
 HEARTBEAT_MONO = time.monotonic()
 SCANNER_THREAD = None
+SQRT2          = math.sqrt(2.0)
+
+TIER_ICONS = {"base": "🌾", "alto": "⚡", "elite": "🔥"}
 
 
 def esc(val) -> str:
@@ -137,6 +177,36 @@ def classify_tier(roi: float) -> tuple[str, str]:
     if roi >= HIGH_ROI:
         return "⚡ NIVEL ALTO (+10% a +17.9%)", "alto"
     return "🌾 NIVEL BASE (+3.5% a +9.9% — Mínimo Radar)", "base"
+
+
+def format_cycle_summary(cycle_hits: list, mode_label: str) -> str:
+    """Construye un resumen limpio mostrando exclusivamente las insignias con cuotas detectadas."""
+    best = max(cycle_hits, key=lambda x: x["roi"])
+    n_base = sum(1 for x in cycle_hits if x["tier_code"] == "base")
+    n_alto = sum(1 for x in cycle_hits if x["tier_code"] == "alto")
+    n_elite = sum(1 for x in cycle_hits if x["tier_code"] == "elite")
+    n_alt = sum(1 for x in cycle_hits if x.get("is_alt"))
+
+    dist_parts = []
+    if n_base > 0:
+        dist_parts.append(f"🌾 Base (3.5%–9.9%): <b>{n_base}</b>")
+    if n_alto > 0:
+        dist_parts.append(f"⚡ Alto (10%–17.9%): <b>{n_alto}</b>")
+    if n_elite > 0:
+        dist_parts.append(f"🔥 Élite (18%+): <b>{n_elite}</b>")
+    if n_alt > 0:
+        dist_parts.append(f"📐 Alt-Line: <b>{n_alt}</b>")
+
+    total = len(cycle_hits)
+    cuota_word = "cuota" if total == 1 else "cuotas"
+    best_icon = TIER_ICONS.get(best["tier_code"], "🌾")
+    dist_line = " | ".join(dist_parts)
+
+    return (
+        f"📊 <b>RESUMEN DE ESCANEO [{mode_label}] ({total} {cuota_word} ≥ {MIN_ROI:.1%})</b>\n"
+        f"• Distribución: {dist_line}\n"
+        f"• {best_icon} Máximo del ciclo: <b>{best['roi']:+.1%}</b> en <b>{esc(best['juego'])}</b> ({esc(best['sport'])}) → {esc(best['pick'])} @ {best['cuota_am']}"
+    )
 
 
 def parse_iso(ts: str):
@@ -157,6 +227,83 @@ def is_fresh(ts_str: str, now_utc: datetime) -> tuple[bool, int, datetime | None
         return False, 999999, None
     age = int((now_utc - dt).total_seconds())
     return (-30 <= age <= MAX_AGE_SEC), max(0, age), dt
+
+
+# --- CALENDARIO INTELIGENTE (MODO TURBO EN HORAS PICO) ---
+def get_schedule_profile(now_utc: datetime) -> tuple[str, int]:
+    """Determina el modo horario en Eastern Time (TURBO, NORMAL o AHORRO)."""
+    if not TURBO_MODE:
+        return "NORMAL", CHECK_INTERVAL
+    local_dt = now_utc.astimezone(ET_TZ)
+    hour_f = local_dt.hour + (local_dt.minute / 60.0)
+    is_weekend = local_dt.weekday() >= 5
+    peak_start = WKND_PEAK_START if is_weekend else PEAK_START_ET
+
+    if peak_start <= hour_f < PEAK_END_ET:
+        return "TURBO", PEAK_INTERVAL
+    if QUIET_START_ET <= hour_f < QUIET_END_ET:
+        return "AHORRO", QUIET_INTERVAL
+    return "NORMAL", CHECK_INTERVAL
+
+
+# --- MATEMÁTICA NORMAL EXACTA PARA ALT-LINE PRICING ---
+def norm_cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / SQRT2))
+
+
+def norm_ppf(p: float) -> float:
+    lo, hi = -8.0, 8.0
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        if norm_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def crosses_football_key_number(pt_ref: float, pt_target: float) -> bool:
+    lo, hi = sorted((abs(pt_ref), abs(pt_target)))
+    return any(lo <= key <= hi for key in FOOTBALL_KEY_NUMBERS)
+
+
+def interpolate_alt_prob(
+    sport: str,
+    mkey: str,
+    outcome_name: str,
+    p_ref: float,
+    pt_ref: float,
+    pt_target: float,
+) -> float | None:
+    """Traslada la probabilidad justa de una línea de referencia a la línea de Hard Rock Bet."""
+    if not ALT_LINE_ENABLED or mkey not in ("spreads", "totals"):
+        return None
+    sport_cfg = ALT_LINE_PARAMS.get(sport)
+    if not sport_cfg or mkey not in sport_cfg:
+        return None
+    sigma, max_diff = sport_cfg[mkey]
+    diff = abs(pt_target - pt_ref)
+    if diff <= 1e-9 or diff > max_diff + 1e-9:
+        return None
+    if not (0.02 <= p_ref <= 0.98):
+        return None
+    if mkey == "spreads" and sport.startswith("americanfootball_") and crosses_football_key_number(pt_ref, pt_target):
+        return None
+
+    z_ref = norm_ppf(p_ref)
+    if mkey == "spreads":
+        dz = (pt_target - pt_ref) / sigma
+    elif outcome_name == "Over":
+        dz = (pt_ref - pt_target) / sigma
+    elif outcome_name == "Under":
+        dz = (pt_target - pt_ref) / sigma
+    else:
+        return None
+
+    p_alt = norm_cdf(z_ref + dz)
+    if not (0.01 <= p_alt <= 0.99):
+        return None
+    return p_alt
 
 
 def outcome_key(o: dict) -> tuple[str, float | None]:
@@ -248,19 +395,14 @@ def estimate_push_prob(mkey: str, point) -> float | None:
     if point is None or isinstance(point, bool) or not isinstance(point, (int, float)):
         return None
     if not math.isclose(point * 2.0, round(point * 2.0), abs_tol=1e-9):
-        return None  # Rechaza cuartos asiáticos (liquidación dividida)
+        return None
     if math.isclose(abs(point) % 1.0, 0.5, abs_tol=1e-9):
         return 0.0
     return PUSH_PROB_SPREAD if mkey == "spreads" else PUSH_PROB_TOTAL
 
 
 def calc_metrics_and_kelly(p_cond: float, decimal_odds: float, q_push: float = 0.0, factor: float = 1.0) -> tuple[float, float, float]:
-    """
-    Matemática exacta con devolución (push):
-      ROI_real = (1 - q_push) * (p_cond * O - 1)
-      p_req    = (1 + MIN_ROI / (1 - q_push)) / O
-      f_full   = (p_cond * O - 1) / (O - 1)  [invariante a q_push para p_cond dada]
-    """
+    """Matemática exacta con devolución (push) y Kelly condicional."""
     roi = (1.0 - q_push) * ((p_cond * decimal_odds) - 1.0)
     p_req = (1.0 + (MIN_ROI / (1.0 - q_push))) / decimal_odds
     b = decimal_odds - 1.0
@@ -480,24 +622,38 @@ def should_alert(sig: str, odds: float, roi: float) -> bool:
     return False
 
 
-# --- MOTOR DE ESCANEO Y REFERENCIA ---
-def build_reference_map(tmarket: dict, target_dt: datetime, books: dict, now_utc: datetime) -> dict:
-    """Construye probabilidades de referencia validadas estructural y temporalmente."""
+# --- MOTOR DE REFERENCIA: LÍNEA EXACTA + INTERPOLACIÓN DE MEDIOS PUNTOS ---
+def _sharp_label(keys: list[str], method_tag: str) -> str:
+    if keys == ["pinnacle"]:
+        return f"Pinnacle ({method_tag})"
+    return f"Multi-Sharp ({method_tag})"
+
+
+def build_reference_map(sport: str, tmarket: dict, target_dt: datetime, books: dict, now_utc: datetime) -> dict:
+    """
+    Construye probabilidades de referencia por selección:
+      1. Prioridad absoluta: emparejamiento exacto de mercado y línea (Sharp > Consenso normalizado).
+      2. Respaldo Alt-Line Pricing: si Hard Rock tiene una línea desplazada (0.5 a 3.5 pts) respecto
+         a las casas de referencia en baloncesto/fútbol americano, interpola la probabilidad justa exacta.
+    Retorna: key_out -> (p_est, source_label, n_refs, k_factor, alt_delta_pts)
+    """
+    mkey = tmarket["key"]
     wanted = {outcome_key(o) for o in tmarket["outcomes"]}
+    wanted_names = {name for name, _ in wanted}
+    target_pt_by_name = {name: pt for name, pt in wanted}
+
     allowed_sharp = set(SHARP_BOOKS) - set(TARGET_BOOKS)
     allowed_ref = set(REF_BOOKS) - set(TARGET_BOOKS)
     allowed_all = allowed_sharp | allowed_ref
 
-    sharp_obs, ref_obs = {}, {}
+    exact_sharp, exact_ref = {}, {}
+    alt_sharp, alt_ref = {}, {}  # bk -> (probs_projected_to_wanted, abs_delta_pts)
+
     for bk, b in books.items():
         if bk not in allowed_all:
             continue
         for m in b.get("markets", []):
-            if m.get("key") != tmarket["key"]:
-                continue
-            if not valid_market(m):
-                continue
-            if {outcome_key(o) for o in m["outcomes"]} != wanted:
+            if m.get("key") != mkey or not valid_market(m):
                 continue
             r_ts = m.get("last_update") or b.get("last_update")
             fresh_r, _, r_dt = is_fresh(r_ts, now_utc)
@@ -506,38 +662,107 @@ def build_reference_map(tmarket: dict, target_dt: datetime, books: dict, now_utc
             if abs((r_dt - target_dt).total_seconds()) > MAX_SKEW_SEC:
                 STATE["skew_rejected"] += 1
                 continue
-            probs = fair_probs(m)
-            if probs:
-                (sharp_obs if bk in allowed_sharp else ref_obs)[bk] = probs
-                break
 
-    # Vector consenso normalizado (garantiza suma 1.0 en 2 y 3 vías)
-    cons_vec = {}
-    cons_spread = {}
-    if len(ref_obs) >= MIN_REF_BOOKS:
-        raw_meds = {k: statistics.median(obs[k] for obs in ref_obs.values()) for k in wanted}
-        tot = math.fsum(raw_meds.values())
-        if tot > 0:
-            cons_vec = {k: v / tot for k, v in raw_meds.items()}
-            for k in wanted:
-                vals = [obs[k] for obs in ref_obs.values()]
-                cons_spread[k] = max(vals) - min(vals)
+            m_keys = {outcome_key(o) for o in m["outcomes"]}
+            if m_keys == wanted:
+                probs = fair_probs(m)
+                if probs:
+                    (exact_sharp if bk in allowed_sharp else exact_ref)[bk] = probs
+                    break
+            elif (
+                ALT_LINE_ENABLED
+                and mkey in ("spreads", "totals")
+                and {name for name, _ in m_keys} == wanted_names
+            ):
+                probs = fair_probs(m)
+                if not probs:
+                    continue
+                projected = {}
+                deltas = []
+                valid_proj = True
+                for (name, pt_ref), p_ref in probs.items():
+                    pt_tgt = target_pt_by_name.get(name)
+                    if pt_ref is None or pt_tgt is None:
+                        valid_proj = False
+                        break
+                    p_alt = interpolate_alt_prob(sport, mkey, name, p_ref, pt_ref, pt_tgt)
+                    if p_alt is None:
+                        valid_proj = False
+                        break
+                    projected[(name, pt_tgt)] = p_alt
+                    deltas.append(abs(pt_tgt - pt_ref))
+                if valid_proj and len(projected) == len(wanted):
+                    tot_p = math.fsum(projected.values())
+                    if tot_p > 0:
+                        projected = {k: v / tot_p for k, v in projected.items()}
+                        avg_delta = statistics.mean(deltas)
+                        (alt_sharp if bk in allowed_sharp else alt_ref)[bk] = (projected, avg_delta)
+                        break
 
     method_tag = "Power" if DEVIG_METHOD != "multiplicative" else "Mult"
+
+    def _build_consensus(obs_dict: dict) -> tuple[dict, dict]:
+        if len(obs_dict) < MIN_REF_BOOKS:
+            return {}, {}
+        raw_meds = {k: statistics.median(obs[k] for obs in obs_dict.values()) for k in wanted}
+        tot = math.fsum(raw_meds.values())
+        if tot <= 0:
+            return {}, {}
+        vec = {k: v / tot for k, v in raw_meds.items()}
+        spreads = {}
+        for k in wanted:
+            vals = [obs[k] for obs in obs_dict.values()]
+            spreads[k] = max(vals) - min(vals)
+        return vec, spreads
+
+    cons_vec, cons_spread = _build_consensus(exact_ref)
+    alt_sharp_probs = {bk: item[0] for bk, item in alt_sharp.items()}
+    alt_ref_probs = {bk: item[0] for bk, item in alt_ref.items()}
+    alt_cons_vec, alt_cons_spread = _build_consensus(alt_ref_probs)
+
     result = {}
     for k in wanted:
-        has_valid_cons = (k in cons_vec) and (cons_spread.get(k, 1.0) <= MAX_REF_SPREAD)
-        if k in cons_vec and not has_valid_cons:
+        has_exact_cons = (k in cons_vec) and (cons_spread.get(k, 1.0) <= MAX_REF_SPREAD)
+        if k in cons_vec and not has_exact_cons:
             STATE["dispersion_rejected"] += 1
 
-        if sharp_obs:
-            p_sharp = statistics.mean(obs[k] for obs in sharp_obs.values())
-            if has_valid_cons and abs(p_sharp - cons_vec[k]) > MAX_SHARP_GAP:
+        # Prioridad 1: Sharp exacto
+        if exact_sharp:
+            p_sharp = statistics.mean(obs[k] for obs in exact_sharp.values())
+            if has_exact_cons and abs(p_sharp - cons_vec[k]) > MAX_SHARP_GAP:
                 STATE["dispersion_rejected"] += 1
                 continue
-            result[k] = (p_sharp, f"Pinnacle ({method_tag})", len(sharp_obs), 1.0)
-        elif has_valid_cons:
-            result[k] = (cons_vec[k], f"Consenso ({method_tag})", len(ref_obs), CONSENSUS_KELLY)
+            label = _sharp_label(list(exact_sharp.keys()), method_tag)
+            result[k] = (p_sharp, label, len(exact_sharp), 1.0, 0.0)
+            continue
+
+        # Prioridad 2: Consenso exacto (corroborado si además existe Alt-Sharp)
+        if has_exact_cons:
+            if alt_sharp_probs:
+                p_alt_sh = statistics.mean(obs[k] for obs in alt_sharp_probs.values())
+                if abs(p_alt_sh - cons_vec[k]) > MAX_SHARP_GAP:
+                    STATE["dispersion_rejected"] += 1
+                    continue
+            result[k] = (cons_vec[k], f"Consenso ({method_tag})", len(exact_ref), CONSENSUS_KELLY, 0.0)
+            continue
+
+        # Prioridad 3: Alt-Line Sharp (captura desfases de medio punto / steam lag)
+        has_alt_cons = (k in alt_cons_vec) and (alt_cons_spread.get(k, 1.0) <= MAX_REF_SPREAD)
+        if alt_sharp_probs:
+            p_alt_sh = statistics.mean(obs[k] for obs in alt_sharp_probs.values())
+            if has_alt_cons and abs(p_alt_sh - alt_cons_vec[k]) > MAX_SHARP_GAP:
+                STATE["dispersion_rejected"] += 1
+                continue
+            avg_d = statistics.mean(item[1] for item in alt_sharp.values())
+            label = _sharp_label(list(alt_sharp.keys()), method_tag) + f" Alt Δ{avg_d:g}"
+            result[k] = (p_alt_sh, label, len(alt_sharp_probs), ALT_LINE_KELLY, avg_d)
+            continue
+
+        # Prioridad 4: Alt-Line Consenso (>= MIN_REF_BOOKS casas movidas juntas)
+        if has_alt_cons:
+            avg_d = statistics.mean(item[1] for item in alt_ref.values())
+            label = f"Consenso ({method_tag}) Alt Δ{avg_d:g}"
+            result[k] = (alt_cons_vec[k], label, len(alt_ref_probs), CONSENSUS_KELLY * ALT_LINE_KELLY, avg_d)
 
     return result
 
@@ -565,7 +790,7 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
             STATE["stale_rejected"] += 1
             continue
 
-        references = build_reference_map(tmarket, target_dt, books, now_utc)
+        references = build_reference_map(sport, tmarket, target_dt, books, now_utc)
         if not references:
             continue
 
@@ -578,7 +803,7 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
             ref = references.get(key_out)
             if ref is None:
                 continue
-            p_est, source, n_refs, k_factor = ref
+            p_est, source, n_refs, k_factor, alt_delta = ref
 
             q_push = estimate_push_prob(mkey, o.get("point"))
             if q_push is None:
@@ -603,6 +828,7 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                 "mercado": mkey,
                 "seleccion": o["name"],
                 "linea": o.get("point"),
+                "alt_delta": round(alt_delta, 2),
                 "casa": target_key,
                 "cuota_dec": round(O, 4),
                 "p_imp": round(p_imp, 4),
@@ -626,7 +852,10 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                 STATE["longshot_blocked"] += 1
                 continue
 
-            linea_str = f" {o['point']:+g}" if o.get("point") is not None else ""
+            if o.get("point") is not None:
+                linea_str = f" {o['point']:g}" if mkey == "totals" else f" {o['point']:+g}"
+            else:
+                linea_str = ""
             cuota_am = f"+{round((O - 1) * 100)}" if O >= 2.0 else f"{round(-100 / (O - 1))}"
 
             cycle_hits.append({
@@ -636,6 +865,7 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                 "cuota_am": cuota_am,
                 "roi": roi,
                 "tier_code": tier_code,
+                "is_alt": alt_delta > 0,
             })
 
             if roi > STATE["max_roi_seen"]:
@@ -648,6 +878,11 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
             ventaja_sobre_piso = roi - MIN_ROI
             monto_str = f" (${BANKROLL * stake_f:,.2f})" if BANKROLL > 0 else ""
             notas = []
+            if alt_delta > 0:
+                notas.append(
+                    f"📐 Alt-Line Pricing (Δ{alt_delta:g} pts): Hard Rock rezagado frente a la línea real "
+                    f"(Kelly ajustado a {ALT_LINE_KELLY:.2f}x)."
+                )
             prev_ev = EVENT_ALERTS.get(ev["id"])
             if prev_ev and sig not in prev_ev["picks"]:
                 notas.append(
@@ -655,10 +890,9 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                     f"(mantén exposición combinada ≤ {MAX_EVENT_PCT:.0%})."
                 )
             if source.startswith("Consenso"):
-                notas.append("ℹ️ Sin Pinnacle: Kelly ajustado a 0.5x por menor certeza.")
-                       if is_longshot:
-                notas.append("⚖️ Cuota larga (alta varianza): Kelly ajustado a 0.5x.")
-
+                notas.append("ℹ️ Sin Sharp directo: Kelly ajustado a 0.5x por menor certeza.")
+            if is_longshot:
+                notas.append("⚡ Cuota larga (alta varianza): Kelly ajustado a 0.5x.")
             if q_push > 0:
                 notas.append(f"ℹ️ Línea entera: ROI real ajustado por push estimado ({q_push:.1%}).")
             if roi >= SUSPECT_ROI:
@@ -675,7 +909,6 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                 f"• Stake guía (0.25x Kelly): <b>{stake_f:.2%}</b>{monto_str}{nota_txt}"
             )
 
-            # Confirmación real de Telegram ANTES de registrar en SENT_CACHE
             if send_telegram(msg):
                 SENT_CACHE[sig] = {"odds": O, "roi": roi, "sent_ts": time.time(), "commence": commence}
                 ev_rec = EVENT_ALERTS.setdefault(ev["id"], {"picks": [], "stake_sum": 0.0, "commence": commence})
@@ -683,6 +916,8 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                     ev_rec["picks"].append(sig)
                     ev_rec["stake_sum"] += stake_f
                 STATE["alerts_sent"] += 1
+                if alt_delta > 0:
+                    STATE["alt_line_alerts"] += 1
 
 
 def heartbeat():
@@ -693,10 +928,12 @@ def heartbeat():
 def run_cycle(quota_alerted: dict) -> int:
     cycle_start = datetime.now(timezone.utc)
     prune_memory(cycle_start)
+    mode_label, base_wait = get_schedule_profile(cycle_start)
+    STATE["schedule_mode"] = mode_label
     cycle_hits = []
     activos = get_active_sports()
+    has_near_game = False
 
-    # Rotación de deportes para repartir presupuesto equitativamente
     if len(SPORTS) > 1:
         SPORTS.append(SPORTS.pop(0))
 
@@ -705,12 +942,20 @@ def run_cycle(quota_alerted: dict) -> int:
             break
         heartbeat()
 
-        now_mono = time.monotonic()
-        if SMART_SCHEDULING and now_mono < SPORT_NEXT.get(sport, 0.0):
+        if sport not in activos:
             STATE["sports_skipped_free"] += 1
             continue
 
-        if sport not in activos:
+        now_mono = time.monotonic()
+        if SMART_SCHEDULING and now_mono < SPORT_NEXT.get(sport, 0.0):
+            cached = EVENT_CACHE.get(sport)
+            if cached:
+                now_tmp = datetime.now(timezone.utc)
+                for ev in cached[1]:
+                    dt = parse_iso(ev.get("commence_time", ""))
+                    if dt and now_tmp < dt <= now_tmp + timedelta(hours=TURBO_HORIZON_H):
+                        has_near_game = True
+                        break
             STATE["sports_skipped_free"] += 1
             continue
 
@@ -718,11 +963,16 @@ def run_cycle(quota_alerted: dict) -> int:
             starts = get_upcoming_starts(sport, datetime.now(timezone.utc))
             if not starts:
                 STATE["sports_skipped_free"] += 1
-                SPORT_NEXT[sport] = time.monotonic() + max(900, CHECK_INTERVAL)
+                SPORT_NEXT[sport] = time.monotonic() + max(900, CHECK_INTERVAL) - 15
                 continue
 
-            events = fetch_odds(sport, datetime.now(timezone.utc))
-            now_after = datetime.now(timezone.utc)  # Reloj fresco tras la descarga
+            now_check = datetime.now(timezone.utc)
+            hrs_to_next = (min(starts) - now_check).total_seconds() / 3600.0
+            if hrs_to_next <= TURBO_HORIZON_H:
+                has_near_game = True
+
+            events = fetch_odds(sport, now_check)
+            now_after = datetime.now(timezone.utc)
             for ev in events:
                 heartbeat()
                 try:
@@ -731,14 +981,17 @@ def run_cycle(quota_alerted: dict) -> int:
                     STATE["last_error"] = f"{sport}/ev: {type(ev_err).__name__}"
 
             if SMART_SCHEDULING:
-                hrs_to_next = (min(starts) - now_after).total_seconds() / 3600.0
-                if hrs_to_next <= 2.0:
-                    next_gap = CHECK_INTERVAL
+                if mode_label == "TURBO" and hrs_to_next <= TURBO_HORIZON_H:
+                    next_gap = PEAK_INTERVAL
+                elif mode_label == "AHORRO" and hrs_to_next > TURBO_HORIZON_H:
+                    next_gap = QUIET_INTERVAL
+                elif hrs_to_next <= 2.0:
+                    next_gap = min(CHECK_INTERVAL, 900) if mode_label == "TURBO" else CHECK_INTERVAL
                 elif hrs_to_next <= 6.0:
                     next_gap = max(CHECK_INTERVAL, 1800)
                 else:
                     next_gap = max(CHECK_INTERVAL, 3600)
-                SPORT_NEXT[sport] = time.monotonic() + next_gap
+                SPORT_NEXT[sport] = time.monotonic() + max(60, next_gap - 15)
 
         except urllib.error.HTTPError as e:
             STATE["last_error"] = f"{sport}: HTTP {e.code}"
@@ -754,40 +1007,24 @@ def run_cycle(quota_alerted: dict) -> int:
 
     quota_alerted["sent"] = False
 
-        if cycle_hits:
-        best = max(cycle_hits, key=lambda x: x["roi"])
-        n_base = sum(1 for x in cycle_hits if x["tier_code"] == "base")
-        n_alto = sum(1 for x in cycle_hits if x["tier_code"] == "alto")
-        n_elite = sum(1 for x in cycle_hits if x["tier_code"] == "elite")
-
-        partes_dist = []
-        if n_base > 0:
-            partes_dist.append(f"🌾 Base ({MIN_ROI:.1%}–{(HIGH_ROI - 0.001):.1%}): <b>{n_base}</b>")
-        if n_alto > 0:
-            partes_dist.append(f"⚡ Alto ({HIGH_ROI:.0%}–{(ELITE_ROI - 0.001):.1%}): <b>{n_alto}</b>")
-        if n_elite > 0:
-            partes_dist.append(f"🔥 Élite ({ELITE_ROI:.0%}+): <b>{n_elite}</b>")
-
-        dist_txt = " | ".join(partes_dist)
-        send_telegram(
-            f"📊 <b>RESUMEN DE ESCANEO ({len(cycle_hits)} cuotas ≥ {MIN_ROI:.1%})</b>\n"
-            f"• Distribución: {dist_txt}\n"
-            f"• 🏆 Máximo del ciclo: <b>{best['roi']:+.1%}</b> en <b>{esc(best['juego'])}</b> ({esc(best['sport'])}) → {esc(best['pick'])} @ {best['cuota_am']}"
-        )
-
-        )
+    if cycle_hits:
+        send_telegram(format_cycle_summary(cycle_hits, mode_label))
 
     STATE["last_scan_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    wait = CHECK_INTERVAL
+
+    if mode_label == "TURBO" and not has_near_game:
+        wait = CHECK_INTERVAL
+    else:
+        wait = base_wait
+
     if STATE["credits_left"] is not None and STATE["credits_left"] < MIN_CREDITS:
-        wait = CHECK_INTERVAL * 4
+        wait = max(wait, CHECK_INTERVAL * 4)
 
     print(
-        f"Ciclo OK | Créditos: {STATE['credits_left']} (último: {STATE['credits_last']}) | "
-        f"Alertas: {STATE['alerts_sent']} | Casi-señales: {STATE['near_misses']} | "
+        f"Ciclo OK [{mode_label}] | Próx: {wait // 60}m | Créditos: {STATE['credits_left']} (últ: {STATE['credits_last']}) | "
+        f"Alertas: {STATE['alerts_sent']} (Alt: {STATE['alt_line_alerts']}) | Casi: {STATE['near_misses']} | "
         f"Viejas: {STATE['stale_rejected']} | Desfase: {STATE['skew_rejected']} | "
-        f"Dispersión: {STATE['dispersion_rejected']} | Incompletos: {STATE['incomplete_rejected']} | "
-        f"Saltados gratis: {STATE['sports_skipped_free']}"
+        f"Dispersión: {STATE['dispersion_rejected']} | Saltados gratis: {STATE['sports_skipped_free']}"
     )
     return wait
 
@@ -800,10 +1037,12 @@ def monitored_wait(seconds: int):
 
 
 def scanner_loop():
+    mode_now, _ = get_schedule_profile(datetime.now(timezone.utc))
     send_telegram(
-        f"🚀 <b>Real Harvest Radar V3.2 ÉLITE</b> activo\n"
-        f"Objetivo: Hard Rock FL | De-vig: <b>{DEVIG_METHOD.upper()}</b> | Intervalo: <b>{CHECK_INTERVAL // 60} min</b>\n"
-        f"Escalones: 🌾 <b>{MIN_ROI:.1%}</b> | ⚡ <b>{HIGH_ROI:.0%}</b> | 🔥 <b>{ELITE_ROI:.0%}</b> | Tope guía: <b>{MAX_STAKE_PCT:.0%}</b> / partido <b>{MAX_EVENT_PCT:.0%}</b>"
+        f"🚀 <b>Real Harvest Radar V3.3 ÉLITE</b> activo\n"
+        f"Objetivo: Hard Rock FL | De-vig: <b>{DEVIG_METHOD.upper()}</b> | Alt-Line: <b>{'ON' if ALT_LINE_ENABLED else 'OFF'}</b>\n"
+        f"Turbo Pico: <b>{PEAK_INTERVAL // 60} min</b> | Normal: <b>{CHECK_INTERVAL // 60} min</b> | Ahorro: <b>{QUIET_INTERVAL // 60} min</b> (Modo: <b>{mode_now}</b>)\n"
+        f"Escalones: 🌾 <b>{MIN_ROI:.1%}</b> | ⚡ <b>{HIGH_ROI:.0%}</b> | 🔥 <b>{ELITE_ROI:.0%}+</b> | Tope guía: <b>{MAX_STAKE_PCT:.0%}</b> / partido <b>{MAX_EVENT_PCT:.0%}</b>"
     )
     quota_alerted = {"sent": False}
     while not STOP.is_set():
