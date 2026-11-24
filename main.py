@@ -656,8 +656,9 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                 )
             if source.startswith("Consenso"):
                 notas.append("ℹ️ Sin Pinnacle: Kelly ajustado a 0.5x por menor certeza.")
-            if is_longshot:
-                notas.append("⚡ Cuota larga (alta varianza): Kelly ajustado a 0.5x.")
+                       if is_longshot:
+                notas.append("⚖️ Cuota larga (alta varianza): Kelly ajustado a 0.5x.")
+
             if q_push > 0:
                 notas.append(f"ℹ️ Línea entera: ROI real ajustado por push estimado ({q_push:.1%}).")
             if roi >= SUSPECT_ROI:
@@ -753,15 +754,27 @@ def run_cycle(quota_alerted: dict) -> int:
 
     quota_alerted["sent"] = False
 
-    if cycle_hits:
+        if cycle_hits:
         best = max(cycle_hits, key=lambda x: x["roi"])
         n_base = sum(1 for x in cycle_hits if x["tier_code"] == "base")
         n_alto = sum(1 for x in cycle_hits if x["tier_code"] == "alto")
         n_elite = sum(1 for x in cycle_hits if x["tier_code"] == "elite")
+
+        partes_dist = []
+        if n_base > 0:
+            partes_dist.append(f"🌾 Base ({MIN_ROI:.1%}–{(HIGH_ROI - 0.001):.1%}): <b>{n_base}</b>")
+        if n_alto > 0:
+            partes_dist.append(f"⚡ Alto ({HIGH_ROI:.0%}–{(ELITE_ROI - 0.001):.1%}): <b>{n_alto}</b>")
+        if n_elite > 0:
+            partes_dist.append(f"🔥 Élite ({ELITE_ROI:.0%}+): <b>{n_elite}</b>")
+
+        dist_txt = " | ".join(partes_dist)
         send_telegram(
             f"📊 <b>RESUMEN DE ESCANEO ({len(cycle_hits)} cuotas ≥ {MIN_ROI:.1%})</b>\n"
-            f"• Distribución: 🌾 Base (3.5%–9.9%): <b>{n_base}</b> | ⚡ Alto (10%–17.9%): <b>{n_alto}</b> | 🔥 Élite (18%+): <b>{n_elite}</b>\n"
+            f"• Distribución: {dist_txt}\n"
             f"• 🏆 Máximo del ciclo: <b>{best['roi']:+.1%}</b> en <b>{esc(best['juego'])}</b> ({esc(best['sport'])}) → {esc(best['pick'])} @ {best['cuota_am']}"
+        )
+
         )
 
     STATE["last_scan_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
