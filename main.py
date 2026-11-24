@@ -90,6 +90,7 @@ DEVIG_METHOD     = os.getenv("DEVIG_METHOD", "power").lower()     # power | mult
 MIN_OVERROUND    = float(os.getenv("MIN_OVERROUND", "1.0"))       # Rechaza mercados incompletos/arbitraje interno
 MAX_OVERROUND    = float(os.getenv("MAX_OVERROUND", "1.15"))      # Rechaza casas con vig excesivo
 MIN_REF_BOOKS    = int(os.getenv("MIN_REF_BOOKS", "3"))
+MIN_DEC_ODDS     = float(os.getenv("MIN_DEC_ODDS", "1.833"))      # Piso -120 (0 = sin límite)
 MAX_REF_SPREAD   = float(os.getenv("MAX_REF_SPREAD", "0.035"))    # Dispersión máx entre casas consenso
 MAX_SHARP_GAP    = float(os.getenv("MAX_SHARP_GAP", "0.04"))      # Choque máx Sharp vs consenso
 MAX_DEC_ODDS     = float(os.getenv("MAX_DEC_ODDS", "0"))          # 0 = espectro abierto; ej. 6.0 bloquea > +500
@@ -150,12 +151,12 @@ STATE = {
 }
 
 # Memoria operativa (purgada automáticamente al iniciar cada partido)
-SENT_CACHE   = {}  # sig -> {"odds": float, "roi": float, "sent_ts": float, "commence": datetime}
-EVENT_ALERTS = {}  # event_id -> {"picks": list[str], "stake_sum": float, "commence": datetime}
-SPORT_NEXT   = {}  # sport -> monotonic timestamp próximo escaneo pagado
-EVENT_CACHE  = {}  # sport -> (monotonic_ts, list_events)
-ACTIVE_CACHE = {"ts": 0.0, "keys": set()}
-CREDIT_DAY   = {"day": None, "spent": 0}
+SENT_CACHE      = {}  # sig -> {"odds": float, "roi": float, "sent_ts": float, "commence": datetime}
+EVENT_ALERTS    = {}  # event_id -> {"picks": list[str], "stake_sum": float, "commence": datetime}
+SPORT_NEXT      = {}  # sport -> monotonic timestamp próximo escaneo pagado
+EVENT_CACHE     = {}  # sport -> (monotonic_ts, list_events)
+ACTIVE_CACHE    = {"ts": 0.0, "keys": set()}
+CREDIT_DAY      = {"day": None, "spent": 0}
 API_BLOCK_UNTIL = 0.0
 
 STOP           = threading.Event()
@@ -797,6 +798,8 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
         for o in tmarket.get("outcomes", []):
             O = o.get("price")
             if isinstance(O, bool) or not isinstance(O, (int, float)) or not math.isfinite(O) or O <= 1.0:
+                continue
+            if MIN_DEC_ODDS > 0 and O < MIN_DEC_ODDS:
                 continue
 
             key_out = outcome_key(o)
