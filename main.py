@@ -1,1117 +1,790 @@
-"""
-Real Harvest Radar V3.3 ÉLITE — Motor +EV / ROI para Hard Rock Bet (Florida)
-Evolución V3.3 (Costo $0 extra en API):
-  1. Modo Turbo en Horas Pico (Calendario Inteligente ET):
-     - Escanea cada 8 min en horas pico de reportes de lesiones/alineaciones SOLO deportes con juegos <= 3.5h
-     - Mantiene 30 min en horario normal y 90 min en madrugada (ahorro de créditos inteligente)
-  2. Interpolación de Medios Puntos (Alt-Line Pricing):
-     - Calcula probabilidad justa exacta con distribución Normal calibrada por deporte (NBA, NCAAB, NCAAW, NFL, NCAAF)
-     - Captura desfases de 0.5 a 3.5 pts cuando el mercado sharp se mueve y Hard Rock Bet queda rezagado
-     - Guardia automática en números clave de NFL/NCAAF (3 y 7) y exclusión de deportes de goles (NHL/Fútbol)
-  3. Visualización Limpia de Insignias en Telegram:
-     - Muestra exclusivamente las insignias activas encontradas en cada ciclo (🌾, ⚡ o 🔥)
-     - El Máximo del ciclo lleva la insignia exacta del escalón alcanzado
-  4. Núcleo V3.2 ÉLITE intacto:
-     - De-vig Power Method + Escuadra Multi-Sharp + Consenso normalizado (suma 1.0)
-     - Reloj fresco por deporte + sincronización de snapshots + matemática exacta de Push
-     - Pre-filtro gratuito (/sports y /events) + confirmación real Telegram + Health Watchdog 24/7
-"""
-import os
-import json
-import time
 import csv
 import math
-import html
-import gzip
-import random
-import signal
+import os
 import threading
-import statistics
-import urllib.request
-import urllib.parse
-import urllib.error
+import time
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Dict, List, Optional, Tuple
+
+import requests
 
 try:
     from zoneinfo import ZoneInfo
-    ET_TZ = ZoneInfo("America/New_York")
+    TZ_ET = ZoneInfo("America/New_York")
 except Exception:
-    ET_TZ = timezone(timedelta(hours=-5))
+    TZ_ET = None
 
-# --- CONFIGURACIÓN Y SECRETOS (Render Environment Variables) ---
-ODDS_API_KEY       = os.getenv("ODDS_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-PORT               = int(os.getenv("PORT", "10000"))
-API_BASE           = "https://api.the-odds-api.com/v4"
 
-SPORTS = [
-    s.strip()
-    for s in os.getenv(
-        "SPORTS",
-        "basketball_nba,americanfootball_nfl,basketball_ncaab,icehockey_nhl,"
-        "americanfootball_ncaaf,basketball_ncaaw,soccer_epl,soccer_spain_la_liga,"
-        "soccer_italy_serie_a,soccer_uefa_champs_league",
-    ).split(",")
-    if s.strip()
-]
+# ==============================================================================
+# 1. CONFIGURACIÓN MAESTRA (VARIABLES DE ENTORNO EN RENDER)
+# ==============================================================================
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-MARKETS          = os.getenv("MARKETS", "h2h,spreads,totals")
-CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "1800"))    # 30 min horario normal
-PEAK_INTERVAL    = int(os.getenv("PEAK_INTERVAL", "480"))      # 8 min Modo Turbo (horas pico)
-QUIET_INTERVAL   = int(os.getenv("QUIET_INTERVAL", "5400"))    # 90 min madrugada (ahorro créditos)
-TURBO_MODE       = os.getenv("TURBO_MODE", "true").lower() == "true"
-TURBO_HORIZON_H  = float(os.getenv("TURBO_HORIZON_H", "3.5"))  # Turbo aplica si próximo juego <= 3.5h
-PEAK_START_ET    = float(os.getenv("PEAK_START_ET", "16.0"))   # L-V 4:00 PM ET
-PEAK_END_ET      = float(os.getenv("PEAK_END_ET", "21.5"))     # L-D 9:30 PM ET
-WKND_PEAK_START  = float(os.getenv("WKND_PEAK_START", "11.0")) # S-D 11:00 AM ET (NFL/NCAAF/NCAAB/EPL)
-QUIET_START_ET   = float(os.getenv("QUIET_START_ET", "0.5"))   # 12:30 AM ET
-QUIET_END_ET     = float(os.getenv("QUIET_END_ET", "9.0"))     # 9:00 AM ET
+BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
+BOOKMAKER_TARGET = "hardrockbet"
 
-HOURS_AHEAD      = int(os.getenv("HOURS_AHEAD", "24"))         # Eventos próximas 24h
-MAX_AGE_SEC      = int(os.getenv("MAX_AGE_SEC", "300"))        # Máx 5 min antigüedad cuota
-MAX_SKEW_SEC     = int(os.getenv("MAX_SKEW_SEC", "120"))       # Desfase máx entre HRB y referencia
-SMART_SCHEDULING = os.getenv("SMART_SCHEDULING", "true").lower() == "true"
-
-TARGET_BOOKS = [b.strip() for b in os.getenv("TARGET_BOOKS", "hardrockbet_fl,hardrockbet").split(",") if b.strip()]
-SHARP_BOOKS  = [b.strip() for b in os.getenv("SHARP_BOOKS", "pinnacle,lowvig,betonlineag,betfair_ex_eu").split(",") if b.strip()]
-REF_BOOKS    = [b.strip() for b in os.getenv("REF_BOOKS", "draftkings,fanduel,betmgm,williamhill_us").split(",") if b.strip()]
-
-# --- UMBRALES +EV Y ESCALONES ---
-MIN_ROI       = float(os.getenv("MIN_ROI", "0.035"))        # +3.5% ROI obligatorio (piso)
-HIGH_ROI      = float(os.getenv("HIGH_ROI", "0.10"))        # +10.0% escalón alto
-ELITE_ROI     = float(os.getenv("ELITE_ROI", "0.18"))       # +18.0% escalón élite (abierto hacia arriba)
-NEAR_MISS_ROI = float(os.getenv("NEAR_MISS_ROI", "0.03"))   # Registro auditoría desde +3.0%
-SUSPECT_ROI   = float(os.getenv("SUSPECT_ROI", "0.45"))     # Advertencia de posible cuota colgada
-
-# --- DE-VIG, ALT-LINE PRICING Y GESTIÓN DE RIESGO ---
-DEVIG_METHOD     = os.getenv("DEVIG_METHOD", "power").lower()     # power | multiplicative
-MIN_OVERROUND    = float(os.getenv("MIN_OVERROUND", "1.0"))       # Rechaza mercados incompletos/arbitraje interno
-MAX_OVERROUND    = float(os.getenv("MAX_OVERROUND", "1.15"))      # Rechaza casas con vig excesivo
-MIN_REF_BOOKS    = int(os.getenv("MIN_REF_BOOKS", "3"))
-MIN_DEC_ODDS     = float(os.getenv("MIN_DEC_ODDS", "1.833"))      # Piso -120 (0 = sin límite)
-MAX_REF_SPREAD   = float(os.getenv("MAX_REF_SPREAD", "0.035"))    # Dispersión máx entre casas consenso
-MAX_SHARP_GAP    = float(os.getenv("MAX_SHARP_GAP", "0.04"))      # Choque máx Sharp vs consenso
-MAX_DEC_ODDS     = float(os.getenv("MAX_DEC_ODDS", "0"))          # 0 = espectro abierto; ej. 6.0 bloquea > +500
-LONGSHOT_ODDS    = float(os.getenv("LONGSHOT_ODDS", "6.0"))       # Desde +500 aplica etiqueta varianza + Kelly reducido
-LONGSHOT_KELLY   = float(os.getenv("LONGSHOT_KELLY", "0.5"))      # Factor Kelly en cuotas largas (>= +500)
-CONSENSUS_KELLY  = float(os.getenv("CONSENSUS_KELLY", "0.5"))     # Factor Kelly cuando falta referencia Sharp
-
-ALT_LINE_ENABLED = os.getenv("ALT_LINE_ENABLED", "true").lower() == "true"
-ALT_LINE_KELLY   = float(os.getenv("ALT_LINE_KELLY", "0.70"))     # Factor Kelly prudente en líneas interpoladas
-
-# Parámetros calibrados de desviación estándar (sigma conservadora) y salto máximo permitido por deporte
-ALT_LINE_PARAMS = {
-    "basketball_nba":          {"spreads": (12.5, 3.5), "totals": (18.5, 4.5)},
-    "basketball_ncaab":        {"spreads": (11.8, 3.5), "totals": (16.0, 4.5)},
-    "basketball_ncaaw":        {"spreads": (12.2, 3.5), "totals": (16.0, 4.5)},
-    "americanfootball_nfl":    {"spreads": (13.8, 1.5), "totals": (13.8, 2.0)},
-    "americanfootball_ncaaf":  {"spreads": (15.8, 1.5), "totals": (16.5, 2.5)},
-}
-FOOTBALL_KEY_NUMBERS = (3.0, 7.0)
-
-PUSH_PROB_SPREAD = float(os.getenv("PUSH_PROB_SPREAD", "0.045"))  # Estimación empírica push en spreads enteros
-PUSH_PROB_TOTAL  = float(os.getenv("PUSH_PROB_TOTAL", "0.040"))   # Estimación empírica push en totales enteros
-
-BANKROLL       = float(os.getenv("BANKROLL", "0"))
-KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))       # 1/4 Kelly
-MAX_STAKE_PCT  = float(os.getenv("MAX_STAKE_PCT", "0.02"))        # Tope 2% por posición
-MAX_EVENT_PCT  = float(os.getenv("MAX_EVENT_PCT", "0.03"))        # Guía máx 3% combinado por partido
-MAX_TOTAL_PCT  = float(os.getenv("MAX_TOTAL_PCT", "0.10"))        # Guía máx 10% exposición total abierta
-
-# --- CRÉDITOS, DEDUPLICACIÓN Y PERSISTENCIA ---
-MIN_CREDITS         = int(os.getenv("MIN_CREDITS", "50"))
-DAILY_CREDIT_BUDGET = int(os.getenv("DAILY_CREDIT_BUDGET", "0"))  # 0 = sin tope diario extra
-ALERT_TTL_SEC       = int(os.getenv("ALERT_TTL_SEC", "3600"))     # Re-alerta tras 1h si sigue +EV
-REALERT_ROI_DELTA   = float(os.getenv("REALERT_ROI_DELTA", "0.02"))
-WATCHDOG_SEC        = int(os.getenv("WATCHDOG_SEC", "900"))       # Heartbeat corre cada <=10s durante esperas
-LOG_FILE            = os.getenv("LOG_FILE", "senales_v33.csv")
-MAX_LOG_BYTES       = int(os.getenv("MAX_LOG_BYTES", "50000000"))
-
-STATE = {
-    "status": "running",
-    "version": "V3.3-ELITE-TURBO",
-    "schedule_mode": "INIT",
-    "last_scan_utc": None,
-    "credits_left": None,
-    "credits_last": None,
-    "daily_credits_spent": 0,
-    "alerts_sent": 0,
-    "alt_line_alerts": 0,
-    "near_misses": 0,
-    "stale_rejected": 0,
-    "skew_rejected": 0,
-    "dispersion_rejected": 0,
-    "incomplete_rejected": 0,
-    "longshot_blocked": 0,
-    "sports_skipped_free": 0,
-    "max_roi_seen": 0.0,
-    "last_error": None,
+# Casas Sharp de referencia (ordenadas por peso de precisión)
+SHARP_WEIGHTS = {
+    "pinnacle": 3.0,
+    "circa": 2.5,
+    "bookmaker": 2.2,
+    "lowvig": 1.8,
+    "betonlineag": 1.5,
+    "fanduel": 1.0,
+    "draftkings": 1.0,
 }
 
-# Memoria operativa (purgada automáticamente al iniciar cada partido)
-SENT_CACHE      = {}  # sig -> {"odds": float, "roi": float, "sent_ts": float, "commence": datetime}
-EVENT_ALERTS    = {}  # event_id -> {"picks": list[str], "stake_sum": float, "commence": datetime}
-SPORT_NEXT      = {}  # sport -> monotonic timestamp próximo escaneo pagado
-EVENT_CACHE     = {}  # sport -> (monotonic_ts, list_events)
-ACTIVE_CACHE    = {"ts": 0.0, "keys": set()}
-CREDIT_DAY      = {"day": None, "spent": 0}
-API_BLOCK_UNTIL = 0.0
+# Cuota mínima permitida: -110 americano equivale a 1.90909 decimal
+CUOTA_MIN_DECIMAL = float(os.getenv("CUOTA_MIN_DECIMAL", "1.905"))
 
-STOP           = threading.Event()
-CSV_LOCK       = threading.Lock()
-HEARTBEAT_MONO = time.monotonic()
-SCANNER_THREAD = None
-SQRT2          = math.sqrt(2.0)
+# Ventana prepartido para escanear submercados y props (en horas antes del inicio)
+SUBMARKET_WINDOW_HOURS = float(os.getenv("SUBMARKET_WINDOW_HOURS", "3.5"))
+ENABLE_SUBMARKETS = os.getenv("ENABLE_SUBMARKETS", "true").lower() == "true"
 
-TIER_ICONS = {"base": "🌾", "alto": "⚡", "elite": "🔥"}
+# Topes de exposición agregada (correlación y blindaje del bankroll)
+MAX_EXPOSICION_PARTIDO = float(os.getenv("MAX_EXPOSICION_PARTIDO", "0.025"))   # 2.5% por partido
+MAX_EXPOSICION_JUGADOR = float(os.getenv("MAX_EXPOSICION_JUGADOR", "0.0075"))  # 0.75% por jugador
+MAX_EXPOSICION_CICLO = float(os.getenv("MAX_EXPOSICION_CICLO", "0.050"))       # 5.0% por ciclo
+
+# Antigüedad máxima aceptada del feed de la API (segundos)
+MAX_FEED_AGE_PRINCIPAL = int(os.getenv("MAX_FEED_AGE_PRINCIPAL", "120"))
+MAX_FEED_AGE_SUBMERCADO = int(os.getenv("MAX_FEED_AGE_SUBMERCADO", "90"))
+
+# Cooldown para evitar alertas repetidas (en segundos)
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "900"))
+CSV_LOG_FILE = os.getenv("CSV_LOG_FILE", "real_harvest_v4_log.csv")
+
+# ==============================================================================
+# 2. CALIBRACIÓN CUANTITATIVA DE 3 CAPAS (CONSENSO DE MÁXIMA PRECISIÓN)
+# ==============================================================================
+CONFIG_CATEGORIAS = {
+    "principal": {
+        "nombre": "JUEGO PRINCIPAL",
+        "icono": "🎯",
+        "min_ev": 0.035,        # +3.5% EV mínimo
+        "delta_p": 0.005,       # 0.5% margen de incertidumbre
+        "kelly_mult": 0.25,     # 0.25x Kelly sobre EV conservador
+        "cap_pct": 0.015,       # Tope 1.50% del bankroll por jugada
+        "exec_window_sec": 30,  # Ejecutar en <= 30 segundos
+        "max_feed_age": MAX_FEED_AGE_PRINCIPAL,
+        "devig": "power",
+    },
+    "mitades": {
+        "nombre": "MITADES / PERIODOS",
+        "icono": "⏱️",
+        "min_ev": 0.050,        # +5.0% EV mínimo
+        "delta_p": 0.010,       # 1.0% margen de incertidumbre
+        "kelly_mult": 0.15,     # 0.15x Kelly sobre EV conservador
+        "cap_pct": 0.010,       # Tope 1.00% del bankroll por jugada
+        "exec_window_sec": 20,  # Ejecutar en <= 20 segundos
+        "max_feed_age": MAX_FEED_AGE_SUBMERCADO,
+        "devig": "shin",
+    },
+    "props": {
+        "nombre": "PROPS & SUBMERCADOS",
+        "icono": "⚡",
+        "min_ev": 0.065,        # +6.5% EV mínimo
+        "delta_p": 0.015,       # 1.5% margen de incertidumbre
+        "kelly_mult": 0.12,     # 0.12x Kelly sobre EV conservador
+        "cap_pct": 0.0075,      # Tope 0.75% del bankroll por jugada
+        "exec_window_sec": 15,  # Ejecutar en <= 15 segundos
+        "max_feed_age": MAX_FEED_AGE_SUBMERCADO,
+        "devig": "shin",
+    },
+}
+
+# ==============================================================================
+# 3. LOS 10 DEPORTES ACTIVOS, ETIQUETAS LIMPIAS Y SUBMERCADOS POR DEPORTE
+# ==============================================================================
+SPORT_LABELS = {
+    "basketball_nba": "NBA",
+    "basketball_ncaab": "NCAAM",
+    "americanfootball_nfl": "NFL",
+    "americanfootball_ncaaf": "NCAAF",
+    "icehockey_nhl": "NHL",
+    "soccer_epl": "EPL",
+    "soccer_spain_la_liga": "La Liga",
+    "soccer_uefa_champs_league": "UCL",
+    "soccer_usa_mls": "MLS",
+    "baseball_mlb": "MLB",
+}
+
+DEPORTES_ACTIVOS = list(SPORT_LABELS.keys())
+
+# Submercados oficiales The Odds API v4 separados por categoría para evitar errores 422
+SPORT_SUBMARKETS = {
+    "basketball_nba": {
+        "mitades": ["h2h_h1", "spreads_h1", "totals_h1", "h2h_h2", "spreads_h2", "totals_h2"],
+        "props": ["player_points", "player_rebounds", "player_assists", "player_threes"],
+    },
+    "basketball_ncaab": {
+        "mitades": ["h2h_h1", "spreads_h1", "totals_h1", "h2h_h2", "spreads_h2", "totals_h2"],
+        "props": [],
+    },
+    "americanfootball_nfl": {
+        "mitades": ["h2h_h1", "spreads_h1", "totals_h1", "h2h_h2", "spreads_h2", "totals_h2"],
+        "props": ["player_pass_yds", "player_rush_yds", "player_reception_yds", "player_receptions"],
+    },
+    "americanfootball_ncaaf": {
+        "mitades": ["h2h_h1", "spreads_h1", "totals_h1", "h2h_h2", "spreads_h2", "totals_h2"],
+        "props": [],
+    },
+    "icehockey_nhl": {
+        "mitades": ["h2h_p1", "spreads_p1", "totals_p1"],
+        "props": ["player_shots_on_goal", "player_points", "player_assists"],
+    },
+    "soccer_epl": {
+        "mitades": ["h2h_h1", "totals_h1"],
+        "props": ["btts", "alternate_totals_corners"],
+    },
+    "soccer_spain_la_liga": {
+        "mitades": ["h2h_h1", "totals_h1"],
+        "props": ["btts", "alternate_totals_corners"],
+    },
+    "soccer_uefa_champs_league": {
+        "mitades": ["h2h_h1", "totals_h1"],
+        "props": ["btts", "alternate_totals_corners"],
+    },
+    "soccer_usa_mls": {
+        "mitades": ["h2h_h1", "totals_h1"],
+        "props": ["btts"],
+    },
+    "baseball_mlb": {
+        "mitades": ["h2h_1st_5_innings", "spreads_1st_5_innings", "totals_1st_5_innings"],
+        "props": ["batter_hits", "batter_total_bases", "pitcher_strikeouts"],
+    },
+}
+
+MARKET_LABELS = {
+    "h2h": "MONEYLINE",
+    "spreads": "SPREAD",
+    "totals": "TOTAL",
+    "h2h_h1": "1H MONEYLINE",
+    "spreads_h1": "1H SPREAD",
+    "totals_h1": "1H TOTAL",
+    "h2h_h2": "2H MONEYLINE",
+    "spreads_h2": "2H SPREAD",
+    "totals_h2": "2H TOTAL",
+    "h2h_p1": "1P MONEYLINE",
+    "spreads_p1": "1P SPREAD",
+    "totals_p1": "1P TOTAL",
+    "h2h_1st_5_innings": "F5 MONEYLINE",
+    "spreads_1st_5_innings": "F5 SPREAD",
+    "totals_1st_5_innings": "F5 TOTAL",
+    "player_points": "PROP PUNTOS",
+    "player_rebounds": "PROP REBOTES",
+    "player_assists": "PROP ASISTENCIAS",
+    "player_threes": "PROP TRIPLES",
+    "player_pass_yds": "PROP YARDAS PASE",
+    "player_rush_yds": "PROP YARDAS CARRERA",
+    "player_reception_yds": "PROP YARDAS RECEPCIÓN",
+    "player_receptions": "PROP RECEPCIONES",
+    "player_shots_on_goal": "PROP TIROS A PUERTA",
+    "batter_hits": "PROP HITS BATEADOR",
+    "batter_total_bases": "PROP BASES TOTALES",
+    "pitcher_strikeouts": "PROP PONCHES",
+    "btts": "AMBOS ANOTAN (BTTS)",
+    "alternate_totals_corners": "CÓRNERS TOTALES",
+}
 
 
-def esc(val) -> str:
-    return html.escape(str(val), quote=False)
+# ==============================================================================
+# 4. ZONA HORARIA ET (MIAMI) CON RESPALDO SEGURO PARA RENDER LINUX SLIM
+# ==============================================================================
+def _us_eastern_offset(dt_utc: datetime) -> timezone:
+    year = dt_utc.year
+    # 2do domingo de marzo (07:00 UTC = 02:00 EST)
+    mar1 = datetime(year, 3, 1, tzinfo=timezone.utc)
+    dst_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7, hours=7)
+    # 1er domingo de noviembre (06:00 UTC = 02:00 EDT)
+    nov1 = datetime(year, 11, 1, tzinfo=timezone.utc)
+    dst_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7, hours=6)
+    if dst_start <= dt_utc < dst_end:
+        return timezone(timedelta(hours=-4))
+    return timezone(timedelta(hours=-5))
 
 
-def classify_tier(roi: float) -> tuple[str, str]:
-    if roi >= ELITE_ROI:
-        return "🔥 NIVEL ÉLITE (+18%+)", "elite"
-    if roi >= HIGH_ROI:
-        return "⚡ NIVEL ALTO (+10% a +17.9%)", "alto"
-    return "🌾 NIVEL BASE (+3.5% a +9.9% — Mínimo Radar)", "base"
+def to_et(dt_utc: datetime) -> datetime:
+    if TZ_ET is not None:
+        return dt_utc.astimezone(TZ_ET)
+    return dt_utc.astimezone(_us_eastern_offset(dt_utc))
 
 
-def format_cycle_summary(cycle_hits: list, mode_label: str) -> str:
-    """Construye un resumen limpio mostrando exclusivamente las insignias con cuotas detectadas."""
-    best = max(cycle_hits, key=lambda x: x["roi"])
-    n_base = sum(1 for x in cycle_hits if x["tier_code"] == "base")
-    n_alto = sum(1 for x in cycle_hits if x["tier_code"] == "alto")
-    n_elite = sum(1 for x in cycle_hits if x["tier_code"] == "elite")
-    n_alt = sum(1 for x in cycle_hits if x.get("is_alt"))
-
-    dist_parts = []
-    if n_base > 0:
-        dist_parts.append(f"🌾 Base (3.5%–9.9%): <b>{n_base}</b>")
-    if n_alto > 0:
-        dist_parts.append(f"⚡ Alto (10%–17.9%): <b>{n_alto}</b>")
-    if n_elite > 0:
-        dist_parts.append(f"🔥 Élite (18%+): <b>{n_elite}</b>")
-    if n_alt > 0:
-        dist_parts.append(f"📐 Alt-Line: <b>{n_alt}</b>")
-
-    total = len(cycle_hits)
-    cuota_word = "cuota" if total == 1 else "cuotas"
-    best_icon = TIER_ICONS.get(best["tier_code"], "🌾")
-    dist_line = " | ".join(dist_parts)
-
-    return (
-        f"📊 <b>RESUMEN DE ESCANEO [{mode_label}] ({total} {cuota_word} ≥ {MIN_ROI:.1%})</b>\n"
-        f"• Distribución: {dist_line}\n"
-        f"• {best_icon} Máximo del ciclo: <b>{best['roi']:+.1%}</b> en <b>{esc(best['juego'])}</b> ({esc(best['sport'])}) → {esc(best['pick'])} @ {best['cuota_am']}"
-    )
+def now_et() -> datetime:
+    return to_et(datetime.now(timezone.utc))
 
 
-def parse_iso(ts: str):
-    if not isinstance(ts, str) or not ts:
+def parse_iso_utc(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def formato_cuenta_regresiva(minutos: float) -> str:
+    mins = max(0, int(round(minutos)))
+    if mins < 60:
+        return f"en {mins} min"
+    horas, rem = divmod(mins, 60)
+    return f"en {horas}h {rem:02d}m"
+
+
+def decimal_a_americana(dec: float) -> str:
+    if dec >= 2.0:
+        return f"+{int(round((dec - 1.0) * 100))}"
+    if dec <= 1.0:
+        return "N/A"
+    return f"{int(round(-100.0 / (dec - 1.0)))}"
+
+
+# ==============================================================================
+# 5. MOTOR MATEMÁTICO: POWER DE-VIG, SHIN DE-VIG EXACTO Y KELLY CONSERVADOR
+# ==============================================================================
+def devig_power(odds_list: List[float]) -> Optional[List[float]]:
+    if any(o <= 1.0 for o in odds_list) or len(odds_list) < 2:
         return None
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            return None
-        return dt.astimezone(timezone.utc)
-    except (ValueError, TypeError):
-        return None
+    qs = [1.0 / o for o in odds_list]
+    if sum(qs) <= 1.0:
+        total = sum(qs)
+        return [q / total for q in qs]
 
-
-def is_fresh(ts_str: str, now_utc: datetime) -> tuple[bool, int, datetime | None]:
-    dt = parse_iso(ts_str)
-    if dt is None:
-        return False, 999999, None
-    age = int((now_utc - dt).total_seconds())
-    return (-30 <= age <= MAX_AGE_SEC), max(0, age), dt
-
-
-# --- CALENDARIO INTELIGENTE (MODO TURBO EN HORAS PICO) ---
-def get_schedule_profile(now_utc: datetime) -> tuple[str, int]:
-    """Determina el modo horario en Eastern Time (TURBO, NORMAL o AHORRO)."""
-    if not TURBO_MODE:
-        return "NORMAL", CHECK_INTERVAL
-    local_dt = now_utc.astimezone(ET_TZ)
-    hour_f = local_dt.hour + (local_dt.minute / 60.0)
-    is_weekend = local_dt.weekday() >= 5
-    peak_start = WKND_PEAK_START if is_weekend else PEAK_START_ET
-
-    if peak_start <= hour_f < PEAK_END_ET:
-        return "TURBO", PEAK_INTERVAL
-    if QUIET_START_ET <= hour_f < QUIET_END_ET:
-        return "AHORRO", QUIET_INTERVAL
-    return "NORMAL", CHECK_INTERVAL
-
-
-# --- MATEMÁTICA NORMAL EXACTA PARA ALT-LINE PRICING ---
-def norm_cdf(z: float) -> float:
-    return 0.5 * (1.0 + math.erf(z / SQRT2))
-
-
-def norm_ppf(p: float) -> float:
-    lo, hi = -8.0, 8.0
-    for _ in range(64):
+    lo, hi = 0.1, 10.0
+    for _ in range(60):
         mid = 0.5 * (lo + hi)
-        if norm_cdf(mid) < p:
+        s = sum(q ** mid for q in qs)
+        if s > 1.0:
             lo = mid
         else:
             hi = mid
-    return 0.5 * (lo + hi)
+    k = 0.5 * (lo + hi)
+    probs = [q ** k for q in qs]
+    norm = sum(probs)
+    return [p / norm for p in probs]
 
 
-def crosses_football_key_number(pt_ref: float, pt_target: float) -> bool:
-    lo, hi = sorted((abs(pt_ref), abs(pt_target)))
-    return any(lo <= key <= hi for key in FOOTBALL_KEY_NUMBERS)
-
-
-def interpolate_alt_prob(
-    sport: str,
-    mkey: str,
-    outcome_name: str,
-    p_ref: float,
-    pt_ref: float,
-    pt_target: float,
-) -> float | None:
-    """Traslada la probabilidad justa de una línea de referencia a la línea de Hard Rock Bet."""
-    if not ALT_LINE_ENABLED or mkey not in ("spreads", "totals"):
+def devig_shin(odds_list: List[float]) -> Optional[List[float]]:
+    if any(o <= 1.0 for o in odds_list) or len(odds_list) < 2:
         return None
-    sport_cfg = ALT_LINE_PARAMS.get(sport)
-    if not sport_cfg or mkey not in sport_cfg:
+    qs = [1.0 / o for o in odds_list]
+    M = sum(qs)
+    if M <= 1.0:
+        return [q / M for q in qs]
+
+    def shin_probs(z: float) -> List[float]:
+        denom = 2.0 * (1.0 - z)
+        out = []
+        for q in qs:
+            disc = z * z + 4.0 * (1.0 - z) * (q * q / M)
+            out.append((math.sqrt(max(0.0, disc)) - z) / denom)
+        return out
+
+    lo, hi = 0.0, 0.999999
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if sum(shin_probs(mid)) > 1.0:
+            lo = mid
+        else:
+            hi = mid
+    probs = shin_probs(0.5 * (lo + hi))
+    norm = sum(probs)
+    return [p / norm for p in probs]
+
+
+def calcular_metricas(
+    p_real: float, cuota_dec: float, categoria: str
+) -> Optional[Dict]:
+    if cuota_dec < CUOTA_MIN_DECIMAL or cuota_dec <= 1.0 or not (0.0 < p_real < 1.0):
         return None
-    sigma, max_diff = sport_cfg[mkey]
-    diff = abs(pt_target - pt_ref)
-    if diff <= 1e-9 or diff > max_diff + 1e-9:
-        return None
-    if not (0.02 <= p_ref <= 0.98):
-        return None
-    if mkey == "spreads" and sport.startswith("americanfootball_") and crosses_football_key_number(pt_ref, pt_target):
+
+    cfg = CONFIG_CATEGORIAS[categoria]
+    ev_est = p_real * cuota_dec - 1.0
+    if ev_est < cfg["min_ev"]:
         return None
 
-    z_ref = norm_ppf(p_ref)
-    if mkey == "spreads":
-        dz = (pt_target - pt_ref) / sigma
-    elif outcome_name == "Over":
-        dz = (pt_ref - pt_target) / sigma
-    elif outcome_name == "Under":
-        dz = (pt_target - pt_ref) / sigma
-    else:
+    p_cons = max(0.001, p_real - cfg["delta_p"])
+    ev_cons = p_cons * cuota_dec - 1.0
+    if ev_cons <= 0.0:
         return None
 
-    p_alt = norm_cdf(z_ref + dz)
-    if not (0.01 <= p_alt <= 0.99):
-        return None
-    return p_alt
+    # Kelly fraccionado aplicado sobre el edge conservador
+    kelly_full = max(0.0, ev_cons / (cuota_dec - 1.0))
+    frac_stake = min(cfg["cap_pct"], cfg["kelly_mult"] * kelly_full)
+
+    # Cuota mínima válida en Hard Rock Bet para mantener piso y EV conservador positivo
+    cuota_min_ev = (1.0 + cfg["min_ev"]) / p_real
+    cuota_min_cons = 1.0001 / p_cons
+    cuota_min_valida = max(CUOTA_MIN_DECIMAL, cuota_min_ev, cuota_min_cons)
+
+    return {
+        "ev_est": ev_est,
+        "ev_cons": ev_cons,
+        "p_real": p_real,
+        "p_cons": p_cons,
+        "p_imp_hrb": 1.0 / cuota_dec,
+        "frac_stake": frac_stake,
+        "cuota_min_valida": cuota_min_valida,
+    }
 
 
-def outcome_key(o: dict) -> tuple[str, float | None]:
-    point = o.get("point")
-    if point is not None:
-        if isinstance(point, bool) or not isinstance(point, (int, float)) or not math.isfinite(point):
-            raise ValueError("Punto inválido")
-        point = round(float(point), 4)
-    return o["name"], point
+# ==============================================================================
+# 6. UTILIDADES DE API, TELEGRAM, CSV Y MODOS HORARIOS ET
+# ==============================================================================
+def obtener_modo_horario() -> Tuple[str, int]:
+    """Devuelve (modo, intervalo_segundos) según hora local ET (Miami)."""
+    hora = now_et().hour
+    if 17 <= hora <= 23:
+        return "TURBO", 180     # Ventana pico NBA/NCAAM/NHL/NFL (cada 3 min)
+    if 11 <= hora < 17:
+        return "NORMAL", 420    # Fútbol Europa + apertura líneas US (cada 7 min)
+    return "AHORRO", 900        # Madrugada (cada 15 min)
 
 
-def valid_market(m: dict) -> bool:
-    """Valida integridad estructural de mercados h2h, spreads y totals."""
-    try:
-        outs = m["outcomes"]
-        if len(outs) < 2:
-            return False
-        keys = [outcome_key(o) for o in outs]
-        if len(set(keys)) != len(keys):
-            return False
-        prices = [o["price"] for o in outs]
-        if any(
-            isinstance(p, bool)
-            or not isinstance(p, (int, float))
-            or not math.isfinite(p)
-            or p <= 1.0
-            for p in prices
-        ):
-            return False
-
-        kind = m["key"]
-        if kind == "h2h":
-            return len(outs) in (2, 3) and all(pt is None for _, pt in keys)
-        if len(outs) != 2:
-            return False
-        if kind == "totals":
-            return (
-                {name for name, _ in keys} == {"Over", "Under"}
-                and all(pt is not None for _, pt in keys)
-                and math.isclose(keys[0][1], keys[1][1], abs_tol=1e-9)
-            )
-        if kind == "spreads":
-            return (
-                keys[0][0] != keys[1][0]
-                and all(pt is not None for _, pt in keys)
-                and math.isclose(keys[0][1] + keys[1][1], 0.0, abs_tol=1e-9)
-            )
-        return False
-    except (KeyError, TypeError, ValueError):
-        return False
-
-
-def fair_probs(market: dict) -> dict:
-    """De-vig mediante Power Method (sum((1/O_i)^k) = 1) o multiplicativo configurable."""
-    if not valid_market(market):
-        return {}
-    outs = market["outcomes"]
-    q = [1.0 / o["price"] for o in outs]
-    overround = math.fsum(q)
-    if not (MIN_OVERROUND <= overround <= MAX_OVERROUND):
-        return {}
-
-    if DEVIG_METHOD == "multiplicative":
-        probs = [v / overround for v in q]
-    else:
-        lo, hi = 1.0, 2.0
-        while math.fsum(v ** hi for v in q) > 1.0:
-            hi *= 2.0
-            if hi > 1024.0:
-                return {}
-        for _ in range(70):
-            mid = (lo + hi) * 0.5
-            if math.fsum(v ** mid for v in q) > 1.0:
-                lo = mid
-            else:
-                hi = mid
-        k = (lo + hi) * 0.5
-        raw = [v ** k for v in q]
-        total = math.fsum(raw)
-        probs = [v / total for v in raw]
-
-    return {outcome_key(o): p for o, p in zip(outs, probs)}
-
-
-def estimate_push_prob(mkey: str, point) -> float | None:
-    """Retorna probabilidad estimada de push. None si es línea asiática de cuarto (.25/.75)."""
-    if mkey not in ("spreads", "totals"):
-        return 0.0
-    if point is None or isinstance(point, bool) or not isinstance(point, (int, float)):
-        return None
-    if not math.isclose(point * 2.0, round(point * 2.0), abs_tol=1e-9):
-        return None
-    if math.isclose(abs(point) % 1.0, 0.5, abs_tol=1e-9):
-        return 0.0
-    return PUSH_PROB_SPREAD if mkey == "spreads" else PUSH_PROB_TOTAL
-
-
-def calc_metrics_and_kelly(p_cond: float, decimal_odds: float, q_push: float = 0.0, factor: float = 1.0) -> tuple[float, float, float]:
-    """Matemática exacta con devolución (push) y Kelly condicional."""
-    roi = (1.0 - q_push) * ((p_cond * decimal_odds) - 1.0)
-    p_req = (1.0 + (MIN_ROI / (1.0 - q_push))) / decimal_odds
-    b = decimal_odds - 1.0
-    if b <= 0 or not (0.0 < p_cond < 1.0) or roi <= 0:
-        return roi, p_req, 0.0
-    f_full = ((p_cond * decimal_odds) - 1.0) / b
-    stake = max(0.0, min(f_full * KELLY_FRACTION * factor, MAX_STAKE_PCT))
-    return roi, p_req, stake
-
-
-# --- TELEGRAM CON CONFIRMACIÓN Y MANEJO 429 ---
-def send_telegram(message: str) -> bool:
+def enviar_telegram(texto: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Faltan credenciales de Telegram.")
-        return False
+        print("[TELEGRAM DESACTIVADO]", texto)
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(url, data=data, method="POST")
-            with urllib.request.urlopen(req, timeout=15) as r:
-                resp = json.loads(r.read().decode("utf-8"))
-            if resp.get("ok") is True:
-                time.sleep(0.35)
-                return True
-            return False
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                retry_after = 5
-                try:
-                    body = json.loads(e.read().decode("utf-8"))
-                    retry_after = int(body.get("parameters", {}).get("retry_after", 5))
-                except Exception:
-                    pass
-                time.sleep(min(30, retry_after) + 0.5)
-                continue
-            print(f"Error Telegram HTTP {e.code}")
-            return False
-        except Exception as e:
-            if attempt == 2:
-                print(f"Error Telegram ({type(e).__name__})")
-                return False
-            time.sleep(1.5 * (attempt + 1))
-    return False
-
-
-# --- CLIENTE THE ODDS API V4 (CRÉDITOS, GZIP Y REINTENTOS) ---
-def _roll_credit_day():
-    today = datetime.now(timezone.utc).date().isoformat()
-    if CREDIT_DAY["day"] != today:
-        CREDIT_DAY["day"] = today
-        CREDIT_DAY["spent"] = 0
-        STATE["daily_credits_spent"] = 0
-
-
-def api_get(path: str, params: dict | None = None, expected_cost: int = 0):
-    global API_BLOCK_UNTIL
-    _roll_credit_day()
-
-    if time.monotonic() < API_BLOCK_UNTIL:
-        raise RuntimeError("API en pausa temporal")
-
-    if expected_cost > 0:
-        left = STATE.get("credits_left")
-        if left is not None and (left - expected_cost) < MIN_CREDITS:
-            raise RuntimeError("Reserva mínima de créditos alcanzada")
-        if DAILY_CREDIT_BUDGET > 0 and (CREDIT_DAY["spent"] + expected_cost) > DAILY_CREDIT_BUDGET:
-            raise RuntimeError("Presupuesto diario de créditos alcanzado")
-
-    query = dict(params or {}, apiKey=ODDS_API_KEY)
-    url = f"{API_BASE}{path}?" + urllib.parse.urlencode(query)
-
-    for attempt in range(3):
-        req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"})
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                raw = r.read()
-                if r.headers.get("Content-Encoding", "").lower() == "gzip":
-                    raw = gzip.decompress(raw)
-                data = json.loads(raw.decode("utf-8"))
-                left = r.headers.get("x-requests-remaining")
-                last = r.headers.get("x-requests-last")
-                if left is not None:
-                    STATE["credits_left"] = int(float(left))
-                if last is not None:
-                    cost = int(float(last))
-                    STATE["credits_last"] = cost
-                    CREDIT_DAY["spent"] += cost
-                    STATE["daily_credits_spent"] = CREDIT_DAY["spent"]
-                return data
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                API_BLOCK_UNTIL = time.monotonic() + 3600
-                raise
-            if e.code == 429:
-                try:
-                    delay = float(e.headers.get("Retry-After", "60"))
-                except (TypeError, ValueError):
-                    delay = 60.0
-                API_BLOCK_UNTIL = time.monotonic() + min(300.0, max(10.0, delay))
-                raise
-            if e.code < 500 or attempt == 2:
-                raise
-        except (urllib.error.URLError, TimeoutError, OSError):
-            if attempt == 2:
-                raise
-        time.sleep((2 ** attempt) + random.random())
-
-
-def get_active_sports() -> set:
-    """GET /v4/sports (0 créditos). Cacheado 6 horas."""
-    now_mono = time.monotonic()
-    if ACTIVE_CACHE["keys"] and (now_mono - ACTIVE_CACHE["ts"]) < 21600:
-        return ACTIVE_CACHE["keys"]
     try:
-        catalog = api_get("/sports", {}, expected_cost=0)
-        keys = {s["key"] for s in catalog if s.get("active")}
-        if keys:
-            ACTIVE_CACHE["keys"] = keys
-            ACTIVE_CACHE["ts"] = now_mono
-            return keys
-    except Exception:
-        pass
-    return set(SPORTS)
-
-
-def get_upcoming_starts(sport: str, now_utc: datetime) -> list[datetime]:
-    """GET /v4/sports/{sport}/events (0 créditos). Cacheado 15 min."""
-    now_mono = time.monotonic()
-    cached = EVENT_CACHE.get(sport)
-    if cached and (now_mono - cached[0]) < 900:
-        agenda = cached[1]
-    else:
-        agenda = api_get(
-            f"/sports/{sport}/events",
-            {
-                "commenceTimeFrom": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "commenceTimeTo": (now_utc + timedelta(hours=HOURS_AHEAD)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": texto,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
             },
-            expected_cost=0,
+            timeout=12,
         )
-        EVENT_CACHE[sport] = (now_mono, agenda)
-
-    end_utc = now_utc + timedelta(hours=HOURS_AHEAD)
-    starts = []
-    for ev in agenda:
-        dt = parse_iso(ev.get("commence_time", ""))
-        if dt and now_utc < dt <= end_utc:
-            starts.append(dt)
-    return starts
+    except Exception as exc:
+        print(f"[ERROR TELEGRAM] {exc}")
 
 
-def fetch_odds(sport: str, now_utc: datetime) -> list[dict]:
-    books = list(dict.fromkeys(TARGET_BOOKS + SHARP_BOOKS + REF_BOOKS))[:10]  # Máx 10 = 1 bloque de créditos
-    markets_list = list(dict.fromkeys(m.strip() for m in MARKETS.split(",") if m.strip()))
-    expected_cost = len(markets_list) * math.ceil(len(books) / 10)
-    return api_get(
-        f"/sports/{sport}/odds",
-        {
-            "bookmakers": ",".join(books),
-            "markets": ",".join(markets_list),
-            "oddsFormat": "decimal",
-            "commenceTimeFrom": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "commenceTimeTo": (now_utc + timedelta(hours=HOURS_AHEAD)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        },
-        expected_cost=expected_cost,
-    )
+def registrar_csv(op: Dict) -> None:
+    file_exists = os.path.isfile(CSV_LOG_FILE)
+    campos = [
+        "timestamp_et", "liga", "hora_partido_et", "partido", "categoria",
+        "mercado", "seleccion", "cuota_hrb_dec", "cuota_min_dec",
+        "p_real", "p_cons", "ev_est_pct", "ev_cons_pct",
+        "stake_pct", "stake_usd", "edad_dato_seg", "sharps_usadas",
+    ]
+    try:
+        with open(CSV_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=campos)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow({
+                "timestamp_et": now_et().strftime("%Y-%m-%d %H:%M:%S"),
+                "liga": op["liga"],
+                "hora_partido_et": op["hora_et_str"],
+                "partido": op["partido"],
+                "categoria": op["categoria"],
+                "mercado": op["mercado_label"],
+                "seleccion": op["seleccion_label"],
+                "cuota_hrb_dec": f"{op['cuota_dec']:.3f}",
+                "cuota_min_dec": f"{op['cuota_min_valida']:.3f}",
+                "p_real": f"{op['p_real']:.4f}",
+                "p_cons": f"{op['p_cons']:.4f}",
+                "ev_est_pct": f"{op['ev_est'] * 100:.2f}",
+                "ev_cons_pct": f"{op['ev_cons'] * 100:.2f}",
+                "stake_pct": f"{op['stake_pct_final'] * 100:.2f}",
+                "stake_usd": f"{op['stake_usd']:.2f}",
+                "edad_dato_seg": op["edad_dato_seg"],
+                "sharps_usadas": op["num_sharps"],
+            })
+    except Exception as exc:
+        print(f"[ERROR CSV] {exc}")
 
 
-# --- PERSISTENCIA CSV SEGURA Y LIMPIEZA DE MEMORIA ---
-def log_row(row: dict):
-    fieldnames = list(row.keys())
-    with CSV_LOCK:
-        parent = os.path.dirname(os.path.abspath(LOG_FILE))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
-            os.replace(LOG_FILE, f"{LOG_FILE}.{int(time.time())}.bak")
-
-        write_header = not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0
-        if not write_header:
-            with open(LOG_FILE, "r", encoding="utf-8") as existing:
-                first_line = existing.readline().strip().split(",")
-            if first_line != fieldnames:
-                os.replace(LOG_FILE, f"{LOG_FILE}.schema_{int(time.time())}.bak")
-                write_header = True
-
-        with open(LOG_FILE, "a", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=fieldnames)
-            if write_header:
-                w.writeheader()
-            w.writerow(row)
+# ==============================================================================
+# 7. EXTRACCIÓN Y EVALUACIÓN EXACTA DE CONTRATOS (MISMO CONTRATO Y LÍNEA)
+# ==============================================================================
+def _contract_group_key(outcome: Dict, market_key: str) -> Tuple:
+    """Agrupa estrictamente los lados opuestos del MISMO contrato y línea."""
+    point = outcome.get("point")
+    desc = (outcome.get("description") or "").strip().lower()
+    if market_key.startswith(("player_", "batter_", "pitcher_")):
+        return (desc, point)
+    if market_key in ("totals", "totals_h1", "totals_h2", "totals_p1",
+                      "totals_1st_5_innings", "alternate_totals_corners"):
+        return ("total", point)
+    if market_key in ("spreads", "spreads_h1", "spreads_h2", "spreads_p1",
+                      "spreads_1st_5_innings"):
+        # En spreads, -5.5 y +5.5 pertenecen al mismo par simétrico (abs(point))
+        return ("spread", abs(float(point)) if point is not None else None)
+    return ("base", None)
 
 
-def prune_memory(now_utc: datetime):
-    for sig in [k for k, v in SENT_CACHE.items() if v["commence"] and v["commence"] <= now_utc]:
-        SENT_CACHE.pop(sig, None)
-    for eid in [k for k, v in EVENT_ALERTS.items() if v["commence"] and v["commence"] <= now_utc]:
-        EVENT_ALERTS.pop(eid, None)
+def _outcome_id(outcome: Dict) -> Tuple:
+    name = (outcome.get("name") or "").strip()
+    desc = (outcome.get("description") or "").strip()
+    point = outcome.get("point")
+    return (desc, name, point)
 
 
-def should_alert(sig: str, odds: float, roi: float) -> bool:
-    prev = SENT_CACHE.get(sig)
-    if prev is None:
-        return True
-    if odds > prev["odds"] + 1e-6:
-        return True
-    if roi >= prev["roi"] + REALERT_ROI_DELTA:
-        return True
-    if (time.time() - prev["sent_ts"]) >= ALERT_TTL_SEC:
-        return True
-    return False
+def _format_seleccion(outcome_id: Tuple) -> str:
+    desc, name, point = outcome_id
+    partes = []
+    if desc:
+        partes.append(desc)
+    partes.append(name)
+    if point is not None:
+        pt_str = f"{point:+g}" if name not in ("Over", "Under") else f"{point:g}"
+        partes.append(pt_str)
+    return " ".join(partes)
 
 
-# --- MOTOR DE REFERENCIA: LÍNEA EXACTA + INTERPOLACIÓN DE MEDIOS PUNTOS ---
-def _sharp_label(keys: list[str], method_tag: str) -> str:
-    if keys == ["pinnacle"]:
-        return f"Pinnacle ({method_tag})"
-    return f"Multi-Sharp ({method_tag})"
+def evaluar_evento(evento: Dict, sport_key: str, categoria_por_mercado: Dict[str, str]) -> List[Dict]:
+    oportunidades = []
+    now_utc = datetime.now(timezone.utc)
+    commence_utc = parse_iso_utc(evento["commence_time"])
 
+    # Regla dura: solo prepartido (evita trampa de latencia en vivo)
+    minutos_inicio = (commence_utc - now_utc).total_seconds() / 60.0
+    if minutos_inicio <= 1.0:
+        return []
 
-def build_reference_map(sport: str, tmarket: dict, target_dt: datetime, books: dict, now_utc: datetime) -> dict:
-    """
-    Construye probabilidades de referencia por selección:
-      1. Prioridad absoluta: emparejamiento exacto de mercado y línea (Sharp > Consenso normalizado).
-      2. Respaldo Alt-Line Pricing: si Hard Rock tiene una línea desplazada (0.5 a 3.5 pts) respecto
-         a las casas de referencia en baloncesto/fútbol americano, interpola la probabilidad justa exacta.
-    Retorna: key_out -> (p_est, source_label, n_refs, k_factor, alt_delta_pts)
-    """
-    mkey = tmarket["key"]
-    wanted = {outcome_key(o) for o in tmarket["outcomes"]}
-    wanted_names = {name for name, _ in wanted}
-    target_pt_by_name = {name: pt for name, pt in wanted}
+    bookmakers = evento.get("bookmakers", [])
+    hrb_book = next((b for b in bookmakers if b.get("key") == BOOKMAKER_TARGET), None)
+    if not hrb_book:
+        return []
 
-    allowed_sharp = set(SHARP_BOOKS) - set(TARGET_BOOKS)
-    allowed_ref = set(REF_BOOKS) - set(TARGET_BOOKS)
-    allowed_all = allowed_sharp | allowed_ref
+    sharp_books = [b for b in bookmakers if b.get("key") in SHARP_WEIGHTS]
+    if not sharp_books:
+        return []
 
-    exact_sharp, exact_ref = {}, {}
-    alt_sharp, alt_ref = {}, {}  # bk -> (probs_projected_to_wanted, abs_delta_pts)
+    liga = SPORT_LABELS.get(sport_key, sport_key.upper())
+    partido = f"{evento.get('away_team', '')} @ {evento.get('home_team', '')}"
+    commence_et = to_et(commence_utc)
+    hora_et_str = commence_et.strftime("%I:%M %p ET")
 
-    for bk, b in books.items():
-        if bk not in allowed_all:
+    # Indexar mercados de Hard Rock Bet
+    for hrb_mkt in hrb_book.get("markets", []):
+        m_key = hrb_mkt.get("key", "")
+        categoria = categoria_por_mercado.get(m_key)
+        if not categoria:
             continue
-        for m in b.get("markets", []):
-            if m.get("key") != mkey or not valid_market(m):
-                continue
-            r_ts = m.get("last_update") or b.get("last_update")
-            fresh_r, _, r_dt = is_fresh(r_ts, now_utc)
-            if not fresh_r or r_dt is None:
-                continue
-            if abs((r_dt - target_dt).total_seconds()) > MAX_SKEW_SEC:
-                STATE["skew_rejected"] += 1
+
+        cfg = CONFIG_CATEGORIAS[categoria]
+        hrb_update = parse_iso_utc(hrb_mkt.get("last_update") or hrb_book.get("last_update"))
+        hrb_age = max(0, int((now_utc - hrb_update).total_seconds()))
+        if hrb_age > cfg["max_feed_age"]:
+            continue
+
+        # Recolectar probabilidades de-viggeadas de cada sharp para cada contrato exacto
+        sharp_probs_acc: Dict[Tuple, List[Tuple[float, float, int]]] = {}
+
+        for sb in sharp_books:
+            sb_key = sb["key"]
+            peso = SHARP_WEIGHTS[sb_key]
+            sb_mkt = next((m for m in sb.get("markets", []) if m.get("key") == m_key), None)
+            if not sb_mkt:
                 continue
 
-            m_keys = {outcome_key(o) for o in m["outcomes"]}
-            if m_keys == wanted:
-                probs = fair_probs(m)
-                if probs:
-                    (exact_sharp if bk in allowed_sharp else exact_ref)[bk] = probs
-                    break
-            elif (
-                ALT_LINE_ENABLED
-                and mkey in ("spreads", "totals")
-                and {name for name, _ in m_keys} == wanted_names
-            ):
-                probs = fair_probs(m)
+            sb_update = parse_iso_utc(sb_mkt.get("last_update") or sb.get("last_update"))
+            sb_age = max(0, int((now_utc - sb_update).total_seconds()))
+            if sb_age > cfg["max_feed_age"]:
+                continue
+
+            # Agrupar resultados por contrato exacto (exige ambos lados del mismo mercado)
+            grupos: Dict[Tuple, List[Dict]] = {}
+            for out in sb_mkt.get("outcomes", []):
+                g_key = _contract_group_key(out, m_key)
+                grupos.setdefault(g_key, []).append(out)
+
+            for g_outcomes in grupos.values():
+                # Obligatorio tener al menos 2 lados del mismo contrato para de-vig exacto
+                if len(g_outcomes) < 2:
+                    continue
+                odds_vals = [float(o["price"]) for o in g_outcomes]
+                probs = devig_shin(odds_vals) if cfg["devig"] == "shin" else devig_power(odds_vals)
                 if not probs:
                     continue
-                projected = {}
-                deltas = []
-                valid_proj = True
-                for (name, pt_ref), p_ref in probs.items():
-                    pt_tgt = target_pt_by_name.get(name)
-                    if pt_ref is None or pt_tgt is None:
-                        valid_proj = False
-                        break
-                    p_alt = interpolate_alt_prob(sport, mkey, name, p_ref, pt_ref, pt_tgt)
-                    if p_alt is None:
-                        valid_proj = False
-                        break
-                    projected[(name, pt_tgt)] = p_alt
-                    deltas.append(abs(pt_tgt - pt_ref))
-                if valid_proj and len(projected) == len(wanted):
-                    tot_p = math.fsum(projected.values())
-                    if tot_p > 0:
-                        projected = {k: v / tot_p for k, v in projected.items()}
-                        avg_delta = statistics.mean(deltas)
-                        (alt_sharp if bk in allowed_sharp else alt_ref)[bk] = (projected, avg_delta)
-                        break
+                for o_obj, p_val in zip(g_outcomes, probs):
+                    oid = _outcome_id(o_obj)
+                    sharp_probs_acc.setdefault(oid, []).append((p_val, peso, sb_age))
 
-    method_tag = "Power" if DEVIG_METHOD != "multiplicative" else "Mult"
-
-    def _build_consensus(obs_dict: dict) -> tuple[dict, dict]:
-        if len(obs_dict) < MIN_REF_BOOKS:
-            return {}, {}
-        raw_meds = {k: statistics.median(obs[k] for obs in obs_dict.values()) for k in wanted}
-        tot = math.fsum(raw_meds.values())
-        if tot <= 0:
-            return {}, {}
-        vec = {k: v / tot for k, v in raw_meds.items()}
-        spreads = {}
-        for k in wanted:
-            vals = [obs[k] for obs in obs_dict.values()]
-            spreads[k] = max(vals) - min(vals)
-        return vec, spreads
-
-    cons_vec, cons_spread = _build_consensus(exact_ref)
-    alt_sharp_probs = {bk: item[0] for bk, item in alt_sharp.items()}
-    alt_ref_probs = {bk: item[0] for bk, item in alt_ref.items()}
-    alt_cons_vec, alt_cons_spread = _build_consensus(alt_ref_probs)
-
-    result = {}
-    for k in wanted:
-        has_exact_cons = (k in cons_vec) and (cons_spread.get(k, 1.0) <= MAX_REF_SPREAD)
-        if k in cons_vec and not has_exact_cons:
-            STATE["dispersion_rejected"] += 1
-
-        # Prioridad 1: Sharp exacto
-        if exact_sharp:
-            p_sharp = statistics.mean(obs[k] for obs in exact_sharp.values())
-            if has_exact_cons and abs(p_sharp - cons_vec[k]) > MAX_SHARP_GAP:
-                STATE["dispersion_rejected"] += 1
-                continue
-            label = _sharp_label(list(exact_sharp.keys()), method_tag)
-            result[k] = (p_sharp, label, len(exact_sharp), 1.0, 0.0)
-            continue
-
-        # Prioridad 2: Consenso exacto (corroborado si además existe Alt-Sharp)
-        if has_exact_cons:
-            if alt_sharp_probs:
-                p_alt_sh = statistics.mean(obs[k] for obs in alt_sharp_probs.values())
-                if abs(p_alt_sh - cons_vec[k]) > MAX_SHARP_GAP:
-                    STATE["dispersion_rejected"] += 1
-                    continue
-            result[k] = (cons_vec[k], f"Consenso ({method_tag})", len(exact_ref), CONSENSUS_KELLY, 0.0)
-            continue
-
-        # Prioridad 3: Alt-Line Sharp (captura desfases de medio punto / steam lag)
-        has_alt_cons = (k in alt_cons_vec) and (alt_cons_spread.get(k, 1.0) <= MAX_REF_SPREAD)
-        if alt_sharp_probs:
-            p_alt_sh = statistics.mean(obs[k] for obs in alt_sharp_probs.values())
-            if has_alt_cons and abs(p_alt_sh - alt_cons_vec[k]) > MAX_SHARP_GAP:
-                STATE["dispersion_rejected"] += 1
-                continue
-            avg_d = statistics.mean(item[1] for item in alt_sharp.values())
-            label = _sharp_label(list(alt_sharp.keys()), method_tag) + f" Alt Δ{avg_d:g}"
-            result[k] = (p_alt_sh, label, len(alt_sharp_probs), ALT_LINE_KELLY, avg_d)
-            continue
-
-        # Prioridad 4: Alt-Line Consenso (>= MIN_REF_BOOKS casas movidas juntas)
-        if has_alt_cons:
-            avg_d = statistics.mean(item[1] for item in alt_ref.values())
-            label = f"Consenso ({method_tag}) Alt Δ{avg_d:g}"
-            result[k] = (alt_cons_vec[k], label, len(alt_ref_probs), CONSENSUS_KELLY * ALT_LINE_KELLY, avg_d)
-
-    return result
-
-
-def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
-    commence = parse_iso(ev.get("commence_time", ""))
-    if commence is None or commence <= now_utc + timedelta(seconds=60):
-        return
-
-    books = {b["key"]: b for b in ev.get("bookmakers", [])}
-    target_key = next((k for k in TARGET_BOOKS if k in books), None)
-    if not target_key:
-        return
-
-    target_book = books[target_key]
-    for tmarket in target_book.get("markets", []):
-        mkey = tmarket.get("key", "")
-        if not valid_market(tmarket):
-            STATE["incomplete_rejected"] += 1
-            continue
-
-        t_ts = tmarket.get("last_update") or target_book.get("last_update")
-        fresh_t, age_t, target_dt = is_fresh(t_ts, now_utc)
-        if not fresh_t or target_dt is None:
-            STATE["stale_rejected"] += 1
-            continue
-
-        references = build_reference_map(sport, tmarket, target_dt, books, now_utc)
-        if not references:
-            continue
-
-        for o in tmarket.get("outcomes", []):
-            O = o.get("price")
-            if isinstance(O, bool) or not isinstance(O, (int, float)) or not math.isfinite(O) or O <= 1.0:
-                continue
-            if MIN_DEC_ODDS > 0 and O < MIN_DEC_ODDS:
+        # Evaluar cada cuota de Hard Rock Bet contra el consenso sharp exacto
+        for out in hrb_mkt.get("outcomes", []):
+            oid = _outcome_id(out)
+            if oid not in sharp_probs_acc:
                 continue
 
-            key_out = outcome_key(o)
-            ref = references.get(key_out)
-            if ref is None:
-                continue
-            p_est, source, n_refs, k_factor, alt_delta = ref
+            cuota_dec = float(out["price"])
+            registros = sharp_probs_acc[oid]
+            total_peso = sum(w for _, w, _ in registros)
+            p_real = sum(p * w for p, w, _ in registros) / total_peso
+            max_age = max(hrb_age, max(age for _, _, age in registros))
 
-            q_push = estimate_push_prob(mkey, o.get("point"))
-            if q_push is None:
-                continue
-
-            is_longshot = O >= LONGSHOT_ODDS
-            effective_k_factor = k_factor * (LONGSHOT_KELLY if is_longshot else 1.0)
-            p_imp = 1.0 / O
-            roi, p_req, stake_f = calc_metrics_and_kelly(p_est, O, q_push, effective_k_factor)
-            if p_req > 1.0 or roi < NEAR_MISS_ROI:
+            metricas = calcular_metricas(p_real, cuota_dec, categoria)
+            if not metricas:
                 continue
 
-            tier_label, tier_code = classify_tier(roi)
-            blocked_longshot = (MAX_DEC_ODDS > 0) and (O > MAX_DEC_ODDS)
-
-            row = {
-                "hora_utc": now_utc.isoformat(timespec="seconds"),
-                "event_id": ev["id"],
-                "deporte": sport,
-                "juego": f"{ev['away_team']} @ {ev['home_team']}",
-                "inicio": ev["commence_time"],
-                "mercado": mkey,
-                "seleccion": o["name"],
-                "linea": o.get("point"),
-                "alt_delta": round(alt_delta, 2),
-                "casa": target_key,
-                "cuota_dec": round(O, 4),
-                "p_imp": round(p_imp, 4),
-                "p_ref": round(p_est, 4),
-                "q_push": round(q_push, 4),
-                "p_req_min": round(p_req, 4),
-                "roi": round(roi, 4),
-                "nivel": tier_code,
-                "fuente": source,
-                "n_casas": n_refs,
-                "edad_seg": age_t,
-                "stake_pct": round(stake_f, 4),
-                "alertada": (roi >= MIN_ROI) and (not blocked_longshot),
-            }
-            log_row(row)
-
-            if roi < MIN_ROI:
-                STATE["near_misses"] += 1
-                continue
-            if blocked_longshot:
-                STATE["longshot_blocked"] += 1
-                continue
-
-            if o.get("point") is not None:
-                linea_str = f" {o['point']:g}" if mkey == "totals" else f" {o['point']:+g}"
-            else:
-                linea_str = ""
-            cuota_am = f"+{round((O - 1) * 100)}" if O >= 2.0 else f"{round(-100 / (O - 1))}"
-
-            cycle_hits.append({
-                "juego": row["juego"],
-                "sport": sport,
-                "pick": f"{mkey.upper()} → {o['name']}{linea_str}",
-                "cuota_am": cuota_am,
-                "roi": roi,
-                "tier_code": tier_code,
-                "is_alt": alt_delta > 0,
+            jugador_key = oid[0].lower() if oid[0] else ""
+            oportunidades.append({
+                "event_id": evento["id"],
+                "sport_key": sport_key,
+                "liga": liga,
+                "partido": partido,
+                "commence_utc": commence_utc,
+                "hora_et_str": hora_et_str,
+                "minutos_inicio": minutos_inicio,
+                "categoria": categoria,
+                "mercado_key": m_key,
+                "mercado_label": MARKET_LABELS.get(m_key, m_key.upper()),
+                "seleccion_id": oid,
+                "seleccion_label": _format_seleccion(oid),
+                "jugador_key": jugador_key,
+                "cuota_dec": cuota_dec,
+                "cuota_am": decimal_a_americana(cuota_dec),
+                "edad_dato_seg": max_age,
+                "num_sharps": len(registros),
+                **metricas,
             })
 
-            if roi > STATE["max_roi_seen"]:
-                STATE["max_roi_seen"] = round(roi, 4)
-
-            sig = f"{ev['id']}|{mkey}|{o['name']}|{key_out[1]}|{target_key}"
-            if not should_alert(sig, O, roi):
-                continue
-
-            ventaja_sobre_piso = roi - MIN_ROI
-            monto_str = f" (${BANKROLL * stake_f:,.2f})" if BANKROLL > 0 else ""
-            notas = []
-            if alt_delta > 0:
-                notas.append(
-                    f"📐 Alt-Line Pricing (Δ{alt_delta:g} pts): Hard Rock rezagado frente a la línea real "
-                    f"(Kelly ajustado a {ALT_LINE_KELLY:.2f}x)."
-                )
-            prev_ev = EVENT_ALERTS.get(ev["id"])
-            if prev_ev and sig not in prev_ev["picks"]:
-                notas.append(
-                    f"🔗 Correlación intra-partido: ya hubo otra señal en este juego "
-                    f"(mantén exposición combinada ≤ {MAX_EVENT_PCT:.0%})."
-                )
-            if source.startswith("Consenso"):
-                notas.append("ℹ️ Sin Sharp directo: Kelly ajustado a 0.5x por menor certeza.")
-            if is_longshot:
-                notas.append("⚡ Cuota larga (alta varianza): Kelly ajustado a 0.5x.")
-            if q_push > 0:
-                notas.append(f"ℹ️ Línea entera: ROI real ajustado por push estimado ({q_push:.1%}).")
-            if roi >= SUSPECT_ROI:
-                notas.append("⚠️ ROI extremo: confirma precio vivo en Hard Rock antes de ejecutar.")
-            nota_txt = ("\n" + "\n".join(notas)) if notas else ""
-
-            msg = (
-                f"{tier_label}\n"
-                f"<b>{esc(row['juego'])}</b> ({esc(sport)})\n"
-                f"• Mercado: {esc(mkey.upper())} → <b>{esc(o['name'])}{esc(linea_str)}</b>\n"
-                f"• Ejecución: <b>{esc(target_key)}</b> @ <b>{cuota_am}</b> (dec {O:.2f} | hace {age_t}s)\n"
-                f"• Probabilidades: p_imp HRB <b>{p_imp:.1%}</b> | p_ref <b>{p_est:.1%}</b> ({esc(source)}, {n_refs}) | p_req({MIN_ROI:+.1%}) <b>{p_req:.1%}</b>\n"
-                f"• ROI real estimado: <b>{roi:+.1%}</b> (<b>{ventaja_sobre_piso:+.1%}</b> sobre piso mínimo)\n"
-                f"• Stake guía (0.25x Kelly): <b>{stake_f:.2%}</b>{monto_str}{nota_txt}"
-            )
-
-            if send_telegram(msg):
-                SENT_CACHE[sig] = {"odds": O, "roi": roi, "sent_ts": time.time(), "commence": commence}
-                ev_rec = EVENT_ALERTS.setdefault(ev["id"], {"picks": [], "stake_sum": 0.0, "commence": commence})
-                if sig not in ev_rec["picks"]:
-                    ev_rec["picks"].append(sig)
-                    ev_rec["stake_sum"] += stake_f
-                STATE["alerts_sent"] += 1
-                if alt_delta > 0:
-                    STATE["alt_line_alerts"] += 1
+    return oportunidades
 
 
-def heartbeat():
-    global HEARTBEAT_MONO
-    HEARTBEAT_MONO = time.monotonic()
+# ==============================================================================
+# 8. GESTOR DE EXPOSICIÓN AGREGADA (PARTIDO / JUGADOR / CICLO)
+# ==============================================================================
+def aplicar_topes_exposicion(oportunidades: List[Dict]) -> List[Dict]:
+    # Priorizar mayor EV conservador al asignar presupuesto, luego ordenar cronológicamente
+    ordenadas_ev = sorted(oportunidades, key=lambda x: x["ev_cons"], reverse=True)
 
+    exp_partido: Dict[str, float] = {}
+    exp_jugador: Dict[str, float] = {}
+    exp_total = 0.0
+    aprobadas = []
 
-def run_cycle(quota_alerted: dict) -> int:
-    cycle_start = datetime.now(timezone.utc)
-    prune_memory(cycle_start)
-    mode_label, base_wait = get_schedule_profile(cycle_start)
-    STATE["schedule_mode"] = mode_label
-    cycle_hits = []
-    activos = get_active_sports()
-    has_near_game = False
-
-    if len(SPORTS) > 1:
-        SPORTS.append(SPORTS.pop(0))
-
-    for sport in list(SPORTS):
-        if STOP.is_set():
+    for op in ordenadas_ev:
+        if exp_total >= MAX_EXPOSICION_CICLO:
             break
-        heartbeat()
 
-        if sport not in activos:
-            STATE["sports_skipped_free"] += 1
+        ev_id = op["event_id"]
+        jug = op["jugador_key"]
+
+        rem_total = MAX_EXPOSICION_CICLO - exp_total
+        rem_partido = MAX_EXPOSICION_PARTIDO - exp_partido.get(ev_id, 0.0)
+        rem_jugador = (
+            MAX_EXPOSICION_JUGADOR - exp_jugador.get(jug, 0.0)
+            if jug else MAX_EXPOSICION_CICLO
+        )
+
+        stake_pct = min(op["frac_stake"], rem_total, rem_partido, rem_jugador)
+        if stake_pct <= 0.0005:  # Menos de 0.05% del bankroll se omite
             continue
 
-        now_mono = time.monotonic()
-        if SMART_SCHEDULING and now_mono < SPORT_NEXT.get(sport, 0.0):
-            cached = EVENT_CACHE.get(sport)
-            if cached:
-                now_tmp = datetime.now(timezone.utc)
-                for ev in cached[1]:
-                    dt = parse_iso(ev.get("commence_time", ""))
-                    if dt and now_tmp < dt <= now_tmp + timedelta(hours=TURBO_HORIZON_H):
-                        has_near_game = True
-                        break
-            STATE["sports_skipped_free"] += 1
+        stake_usd = round(BANKROLL * stake_pct, 2)
+        if stake_usd < 1.0:
             continue
 
+        exp_total += stake_pct
+        exp_partido[ev_id] = exp_partido.get(ev_id, 0.0) + stake_pct
+        if jug:
+            exp_jugador[jug] = exp_jugador.get(jug, 0.0) + stake_pct
+
+        op["stake_pct_final"] = stake_pct
+        op["stake_usd"] = stake_usd
+        aprobadas.append(op)
+
+    # Orden final 100% CRONOLÓGICO (partidos más cercanos primero)
+    aprobadas.sort(key=lambda x: (x["commence_utc"], -x["ev_est"]))
+    return aprobadas
+
+
+# ==============================================================================
+# 9. CONSULTAS A THE ODDS API (CAPA 1: 10 DEPORTES | CAPA 2: SUBMERCADOS)
+# ==============================================================================
+def obtener_deportes_en_temporada() -> List[str]:
+    """Consulta gratuita (0 créditos) para escanear solo ligas con cartelera activa."""
+    url = "https://api.the-odds-api.com/v4/sports/"
+    try:
+        r = requests.get(url, params={"apiKey": ODDS_API_KEY}, timeout=12)
+        if r.status_code == 200:
+            activos_api = {s["key"] for s in r.json() if s.get("active")}
+            return [s for s in DEPORTES_ACTIVOS if s in activos_api]
+    except Exception as exc:
+        print(f"[WARN SPORTS] {exc}")
+    return DEPORTES_ACTIVOS
+
+
+def escanear_ciclo() -> Tuple[List[Dict], Optional[str]]:
+    oportunidades_raw: List[Dict] = []
+    creditos_restantes: Optional[str] = None
+    now_utc = datetime.now(timezone.utc)
+    deportes = obtener_deportes_en_temporada()
+
+    for sport_key in deportes:
+        # --- CAPA 1: JUEGO PRINCIPAL (h2h, spreads, totals) ---
+        url_main = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
+        params_main = {
+            "apiKey": ODDS_API_KEY,
+            "regions": "us,eu",
+            "markets": "h2h,spreads,totals",
+            "oddsFormat": "decimal",
+        }
         try:
-            starts = get_upcoming_starts(sport, datetime.now(timezone.utc))
-            if not starts:
-                STATE["sports_skipped_free"] += 1
-                SPORT_NEXT[sport] = time.monotonic() + max(900, CHECK_INTERVAL) - 15
+            resp = requests.get(url_main, params=params_main, timeout=15)
+            creditos_restantes = resp.headers.get("x-requests-remaining", creditos_restantes)
+            if resp.status_code != 200:
                 continue
-
-            now_check = datetime.now(timezone.utc)
-            hrs_to_next = (min(starts) - now_check).total_seconds() / 3600.0
-            if hrs_to_next <= TURBO_HORIZON_H:
-                has_near_game = True
-
-            events = fetch_odds(sport, now_check)
-            now_after = datetime.now(timezone.utc)
-            for ev in events:
-                heartbeat()
-                try:
-                    scan_event(sport, ev, now_after, cycle_hits)
-                except Exception as ev_err:
-                    STATE["last_error"] = f"{sport}/ev: {type(ev_err).__name__}"
-
-            if SMART_SCHEDULING:
-                if mode_label == "TURBO" and hrs_to_next <= TURBO_HORIZON_H:
-                    next_gap = PEAK_INTERVAL
-                elif mode_label == "AHORRO" and hrs_to_next > TURBO_HORIZON_H:
-                    next_gap = QUIET_INTERVAL
-                elif hrs_to_next <= 2.0:
-                    next_gap = min(CHECK_INTERVAL, 900) if mode_label == "TURBO" else CHECK_INTERVAL
-                elif hrs_to_next <= 6.0:
-                    next_gap = max(CHECK_INTERVAL, 1800)
-                else:
-                    next_gap = max(CHECK_INTERVAL, 3600)
-                SPORT_NEXT[sport] = time.monotonic() + max(60, next_gap - 15)
-
-        except urllib.error.HTTPError as e:
-            STATE["last_error"] = f"{sport}: HTTP {e.code}"
-            if e.code in (401, 403, 429):
-                if not quota_alerted.get("sent"):
-                    send_telegram(f"⛔ <b>The Odds API respondió HTTP {e.code}</b> (créditos o límite). Pausa protectora activada.")
-                    quota_alerted["sent"] = True
-                return CHECK_INTERVAL * 4
-            print(f"[{sport}] HTTP {e.code}")
-        except Exception as e:
-            STATE["last_error"] = f"{sport}: {type(e).__name__}"
-            print(f"[{sport}] Error en ciclo: {type(e).__name__}")
-
-    quota_alerted["sent"] = False
-
-    if cycle_hits:
-        send_telegram(format_cycle_summary(cycle_hits, mode_label))
-
-    STATE["last_scan_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    if mode_label == "TURBO" and not has_near_game:
-        wait = CHECK_INTERVAL
-    else:
-        wait = base_wait
-
-    if STATE["credits_left"] is not None and STATE["credits_left"] < MIN_CREDITS:
-        wait = max(wait, CHECK_INTERVAL * 4)
-
-    print(
-        f"Ciclo OK [{mode_label}] | Próx: {wait // 60}m | Créditos: {STATE['credits_left']} (últ: {STATE['credits_last']}) | "
-        f"Alertas: {STATE['alerts_sent']} (Alt: {STATE['alt_line_alerts']}) | Casi: {STATE['near_misses']} | "
-        f"Viejas: {STATE['stale_rejected']} | Desfase: {STATE['skew_rejected']} | "
-        f"Dispersión: {STATE['dispersion_rejected']} | Saltados gratis: {STATE['sports_skipped_free']}"
-    )
-    return wait
-
-
-def monitored_wait(seconds: int):
-    deadline = time.monotonic() + seconds
-    while not STOP.is_set() and time.monotonic() < deadline:
-        heartbeat()
-        STOP.wait(min(10.0, max(0.5, deadline - time.monotonic())))
-
-
-def scanner_loop():
-    mode_now, _ = get_schedule_profile(datetime.now(timezone.utc))
-    send_telegram(
-        f"🚀 <b>Real Harvest Radar V3.3 ÉLITE</b> activo\n"
-        f"Objetivo: Hard Rock FL | De-vig: <b>{DEVIG_METHOD.upper()}</b> | Alt-Line: <b>{'ON' if ALT_LINE_ENABLED else 'OFF'}</b>\n"
-        f"Turbo Pico: <b>{PEAK_INTERVAL // 60} min</b> | Normal: <b>{CHECK_INTERVAL // 60} min</b> | Ahorro: <b>{QUIET_INTERVAL // 60} min</b> (Modo: <b>{mode_now}</b>)\n"
-        f"Escalones: 🌾 <b>{MIN_ROI:.1%}</b> | ⚡ <b>{HIGH_ROI:.0%}</b> | 🔥 <b>{ELITE_ROI:.0%}+</b> | Tope guía: <b>{MAX_STAKE_PCT:.0%}</b> / partido <b>{MAX_EVENT_PCT:.0%}</b>"
-    )
-    quota_alerted = {"sent": False}
-    while not STOP.is_set():
-        heartbeat()
-        if not ODDS_API_KEY:
-            print("Falta ODDS_API_KEY.")
-            monitored_wait(60)
+            eventos = resp.json()
+        except Exception as exc:
+            print(f"[ERROR MAIN {sport_key}] {exc}")
             continue
-        try:
-            wait = run_cycle(quota_alerted)
-            STATE["status"] = "running"
-        except Exception as e:
-            STATE["status"] = "degraded"
-            STATE["last_error"] = f"ciclo: {type(e).__name__}"
-            print(f"Error general del ciclo: {type(e).__name__}")
-            wait = 60
-        monitored_wait(wait)
+
+        cat_main = {"h2h": "principal", "spreads": "principal", "totals": "principal"}
+        eventos_ventana_sub = []
+
+        for ev in eventos:
+            oportunidades_raw.extend(evaluar_evento(ev, sport_key, cat_main))
+            commence_utc = parse_iso_utc(ev["commence_time"])
+            horas_faltan = (commence_utc - now_utc).total_seconds() / 3600.0
+            if 0.05 <= horas_faltan <= SUBMARKET_WINDOW_HOURS:
+                eventos_ventana_sub.append(ev)
+
+        # --- CAPA 2: MITADES Y PROPS (SOLO EVENTOS DENTRO DE VENTANA PREPARTIDO) ---
+        if not ENABLE_SUBMARKETS:
+            continue
+
+        sub_cfg = SPORT_SUBMARKETS.get(sport_key, {})
+        for ev in eventos_ventana_sub:
+            ev_id = ev["id"]
+            for sub_cat in ("mitades", "props"):
+                mkts = sub_cfg.get(sub_cat, [])
+                if not mkts:
+                    continue
+                url_ev = f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{ev_id}/odds"
+                params_ev = {
+                    "apiKey": ODDS_API_KEY,
+                    "regions": "us,eu",
+                    "markets": ",".join(mkts),
+                    "oddsFormat": "decimal",
+                }
+                try:
+                    r_sub = requests.get(url_ev, params=params_ev, timeout=15)
+                    creditos_restantes = r_sub.headers.get("x-requests-remaining", creditos_restantes)
+                    if r_sub.status_code != 200:
+                        continue
+                    ev_sub = r_sub.json()
+                    cat_map = {m: sub_cat for m in mkts}
+                    oportunidades_raw.extend(evaluar_evento(ev_sub, sport_key, cat_map))
+                except Exception as exc:
+                    print(f"[ERROR SUB {sport_key}/{ev_id}] {exc}")
+
+    aprobadas = aplicar_topes_exposicion(oportunidades_raw)
+    return aprobadas, creditos_restantes
 
 
+# ==============================================================================
+# 10. FORMATEO ULTRARRÁPIDO PARA TELEGRAM (ENTRADA DIRECTA A HARD ROCK BET)
+# ==============================================================================
+def formatear_alerta(op: Dict) -> str:
+    cfg = CONFIG_CATEGORIAS[op["categoria"]]
+    countdown = formato_cuenta_regresiva(op["minutos_inicio"])
+    cuota_min_am = decimal_a_americana(op["cuota_min_valida"])
+
+    return (
+        f"{cfg['icono']} <b>{op['liga']} | ⏰ {op['hora_et_str']} ({countdown})</b>\n"
+        f"🏟 <b>{op['partido']}</b>\n"
+        f"📌 <b>{op['mercado_label']} → {op['seleccion_label']}</b>\n"
+        f"💵 <b>Hard Rock Bet: {op['cuota_am']} (dec {op['cuota_dec']:.2f})</b>\n"
+        f"🛡 Cuota mín. válida: <b>{cuota_min_am} (dec {op['cuota_min_valida']:.2f})</b>\n"
+        f"💰 <b>Stake guía: ${op['stake_usd']:.2f} ({op['stake_pct_final']*100:.2f}% BR)</b>\n"
+        f"📈 EV Est: <b>+{op['ev_est']*100:.1f}%</b> | EV Cons: <b>+{op['ev_cons']*100:.1f}%</b>\n"
+        f"📊 p_real: {op['p_real']*100:.1f}% ({op['num_sharps']} sharps, {cfg['devig'].upper()}) | p_HRB: {op['p_imp_hrb']*100:.1f}%\n"
+        f"⚡ Dato: hace {op['edad_dato_seg']}s | <b>Ejecutar en ≤ {cfg['exec_window_sec']}s</b>"
+    )
+
+
+def formatear_resumen(aprobadas: List[Dict], modo: str, creditos: Optional[str]) -> str:
+    hora_actual = now_et().strftime("%I:%M %p ET")
+    lineas = [
+        f"📊 <b>RESUMEN CRONOLÓGICO [{modo}] — {hora_actual}</b>",
+        f"🔥 Oportunidades ejecutables: <b>{len(aprobadas)}</b>",
+        "",
+    ]
+    for i, op in enumerate(aprobadas[:12], start=1):
+        cfg = CONFIG_CATEGORIAS[op["categoria"]]
+        lineas.append(
+            f"{i}. {cfg['icono']} <b>{op['hora_et_str']}</b> | {op['liga']} | "
+            f"{op['partido']} → <b>{op['mercado_label']}: {op['seleccion_label']}</b> "
+            f"@ {op['cuota_am']} (dec {op['cuota_dec']:.2f}) | "
+            f"<b>+{op['ev_est']*100:.1f}%</b> | <b>${op['stake_usd']:.2f}</b>"
+        )
+    if creditos is not None:
+        lineas.append(f"\n🔋 Créditos API restantes: {creditos}")
+    return "\n".join(lineas)
+
+
+# ==============================================================================
+# 11. SERVIDOR HEALTH CHECK PARA RENDER + BUCLE PRINCIPAL 24/7
+# ==============================================================================
 class HealthHandler(BaseHTTPRequestHandler):
-    def _health_status(self):
-        alive = SCANNER_THREAD is not None and SCANNER_THREAD.is_alive()
-        hb_age = time.monotonic() - HEARTBEAT_MONO
-        healthy = alive and (hb_age < WATCHDOG_SEC)
-        return healthy, alive, round(hb_age, 1)
-
     def do_GET(self):
-        if self.path not in ("/", "/health", "/healthz"):
-            self.send_error(404)
-            return
-        healthy, alive, hb_age = self._health_status()
-        body = json.dumps({
-            **STATE,
-            "scanner_alive": alive,
-            "heartbeat_age_sec": hb_age,
-        }).encode("utf-8")
-        self.send_response(200 if healthy else 503)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(b"Real Harvest Radar V4.0 ELITE OK")
 
-    def do_HEAD(self):
-        healthy, _, _ = self._health_status()
-        self.send_response(200 if healthy else 503)
-        self.end_headers()
-
-    def log_message(self, *args):
+    def log_message(self, format, *args):
         return
+
+
+def iniciar_servidor_health() -> None:
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"[RENDER HEALTH] Escuchando en puerto {port}")
+    server.serve_forever()
+
+
+def main() -> None:
+    if not ODDS_API_KEY:
+        raise RuntimeError("Falta configurar la variable de entorno ODDS_API_KEY en Render.")
+
+    threading.Thread(target=iniciar_servidor_health, daemon=True).start()
+
+    historial_alertas: Dict[Tuple, Tuple[float, float]] = {}
+    print(f"[INICIO] Real Harvest Radar V4.0 ÉLITE activo | Bankroll: ${BANKROLL:.2f}")
+
+    while True:
+        modo, intervalo = obtener_modo_horario()
+        try:
+            aprobadas, creditos = escanear_ciclo()
+            ahora_ts = time.time()
+            nuevas_alertas = []
+
+            for op in aprobadas:
+                clave = (op["event_id"], op["mercado_key"], op["seleccion_id"])
+                prev = historial_alertas.get(clave)
+                # Enviar si es nueva, pasó el cooldown o el EV subió >= 1.5%
+                if (
+                    prev is None
+                    or (ahora_ts - prev[0]) >= ALERT_COOLDOWN_SEC
+                    or (op["ev_est"] - prev[1]) >= 0.015
+                ):
+                    nuevas_alertas.append(op)
+                    historial_alertas[clave] = (ahora_ts, op["ev_est"])
+                    registrar_csv(op)
+
+            if nuevas_alertas:
+                # 1ro: Mapa cronológico completo para priorizar en 2 segundos
+                enviar_telegram(formatear_resumen(nuevas_alertas, modo, creditos))
+                # 2do: Tarjetas individuales en orden cronológico ascendente
+                for op in nuevas_alertas:
+                    enviar_telegram(formatear_alerta(op))
+                    time.sleep(0.4)
+
+            print(
+                f"[{now_et().strftime('%H:%M:%S ET')}] Ciclo [{modo}] completado | "
+                f"Aprobadas: {len(aprobadas)} | Enviadas: {len(nuevas_alertas)} | "
+                f"Créditos: {creditos} | Próximo en {intervalo}s"
+            )
+        except Exception as exc:
+            print(f"[ERROR CICLO] {exc}")
+
+        time.sleep(intervalo)
 
 
 if __name__ == "__main__":
-    SCANNER_THREAD = threading.Thread(target=scanner_loop, name="radar-scanner", daemon=True)
-    SCANNER_THREAD.start()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
-
-    def handle_shutdown(*_):
-        STOP.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
-
-    try:
-        server.serve_forever(poll_interval=0.5)
-    finally:
-        STOP.set()
-        server.server_close()
-        SCANNER_THREAD.join(timeout=20)
+    main()
