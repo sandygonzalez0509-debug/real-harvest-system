@@ -975,8 +975,16 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
             )
 
             nota_txt = ("\n" + "\n".join(notas)) if notas else ""
+            dt_juego = parse_iso(ev.get("commence_time", ""))
+            if dt_juego:
+            dt_miami = dt_juego.astimezone(ET_TZ)
+            hora_miami = dt_miami.strftime("%d/%m %I:%M %p ET")
+            else:
+            hora_miami = "Por confirmar"
 
             msg = (
+            f"🕒 Horario Miami: <b>{hora_miami}</b>\n"
+
                 f"{tier_label}\n"
                 f"<b>{esc(row['juego'])}</b> ({esc(sport)})\n"
                 f"• Mercado: {esc(mkey.upper())} → <b>{esc(o['name'])}{esc(linea_str)}</b>\n"
