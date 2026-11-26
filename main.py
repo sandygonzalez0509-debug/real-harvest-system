@@ -32,6 +32,60 @@ import urllib.parse
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from openai import OpenAI
+from pinecone import Pinecone
+
+# Inicialización del Cerebro RAG (92 libros)
+oai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+rh_index = pc.Index("rh-vectors-1024-v1")
+
+def auditar_con_biblioteca(alerta: dict) -> dict:
+    try:
+        query_text = (
+            f"Auditoría +EV {alerta['deporte']} mercado {alerta['mercado']} "
+            f"cuota {alerta['cuota_hrb']} ROI {alerta['roi_pct']}% "
+            f"alt-line delta {alerta['delta_pts']} puntos gestión Kelly varianza"
+        )
+        emb_resp = oai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=query_text,
+            dimensions=1024
+        )
+        res = rh_index.query(
+            vector=emb_resp.data[0].embedding,
+            top_k=6,
+            namespace="rh-te3small-1024-v1",
+            include_metadata=True
+        )
+        contexto_libros = "\n---\n".join(
+            match.metadata.get("text", match.metadata.get("chunk_text", ""))
+            for match in res.matches
+            if match.metadata
+        )
+        prompt_sistema = (
+            "Eres el Auditor Cuantitativo de Real Harvest. Evalúa la señal matemática "
+            "usando únicamente los principios de la biblioteca adjunta. "
+            "Responde estrictamente en JSON con las claves: "
+            "'aprobada' (boolean), 'resumen' (máximo 2 líneas técnicas y directas) y "
+            "'principio_clave' (ley o concepto de la biblioteca que respalda el veredicto)."
+        )
+        chat_resp = oai_client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt_sistema},
+                {"role": "user", "content": f"SEÑAL:\n{json.dumps(alerta, ensure_ascii=False)}\n\nBIBLIOTECA:\n{contexto_libros}"}
+            ]
+        )
+        return json.loads(chat_resp.choices[0].message.content)
+    except Exception as e:
+        return {
+            "aprobada": True,
+            "resumen": f"Señal matemática pura (auditoría en pausa: {str(e)[:60]})",
+            "principio_clave": "Consenso Multi-Sharp + Kelly"
+        }
 
 try:
     from zoneinfo import ZoneInfo
@@ -904,6 +958,22 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                 notas.append(f"ℹ️ Línea entera: ROI real ajustado por push estimado ({q_push:.1%}).")
             if roi >= SUSPECT_ROI:
                 notas.append("⚠️ ROI extremo: confirma precio vivo en Hard Rock antes de ejecutar.")
+            auditoria = auditar_con_biblioteca({
+                "deporte": sport,
+                "mercado": f"{mkey.upper()} -> {o['name']}{linea_str}",
+                "cuota_hrb": cuota_am,
+                "p_ref": round(p_est * 100, 1),
+                "roi_pct": round(roi * 100, 1),
+                "delta_pts": round(alt_delta, 2),
+                "kelly_pct": round(stake_f * 100, 2)
+            })
+            if not auditoria.get("aprobada", True):
+                continue
+            notas.append(
+                f"📚 <b>Biblioteca (92 libros):</b> {esc(auditoria.get('resumen', ''))} "
+                f"(<i>Base: {esc(auditoria.get('principio_clave', ''))}</i>)"
+            )
+
             nota_txt = ("\n" + "\n".join(notas)) if notas else ""
 
             msg = (
