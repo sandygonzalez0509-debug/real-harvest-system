@@ -870,12 +870,7 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
             roi, p_req, stake_f = calc_metrics_and_kelly(p_est, O, q_push, effective_k_factor)
             if p_req > 1.0 or roi < NEAR_MISS_ROI:
                 continue
-        for o in tmarket.get("outcomes", []):
-            O = o.get("price")
-            if isinstance(O, bool) or not isinstance(O, (int, float)) or not math.isfinite(O) or O <= 1.0:
-                continue
-            if MIN_DEC_ODDS > 0 and O < MIN_DEC_ODDS:
-                continue
+
 
             tier_label, tier_code = classify_tier(roi)
             blocked_longshot = (MAX_DEC_ODDS > 0) and (O > MAX_DEC_ODDS)
@@ -977,13 +972,13 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
             nota_txt = ("\n" + "\n".join(notas)) if notas else ""
             dt_juego = parse_iso(ev.get("commence_time", ""))
             if dt_juego:
-            dt_miami = dt_juego.astimezone(ET_TZ)
-            hora_miami = dt_miami.strftime("%d/%m %I:%M %p ET")
+               dt_miami = dt_juego.astimezone(ET_TZ)
+               hora_miami = dt_miami.strftime("%d/%m %I:%M %p ET")
             else:
-            hora_miami = "Por confirmar"
+                hora_miami = "Por confirmar"
 
             msg = (
-            f"🕒 Horario Miami: <b>{hora_miami}</b>\n"
+                f"🕒 Horario Miami: <b>{hora_miami}</b>\n"
 
                 f"{tier_label}\n"
                 f"<b>{esc(row['juego'])}</b> ({esc(sport)})\n"
