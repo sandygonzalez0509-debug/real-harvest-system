@@ -320,7 +320,7 @@ def format_cycle_summary(cycle_hits: list, mode_label: str) -> str:
     return (
         f"📊 <b>RESUMEN DE ESCANEO [{mode_label}] ({total} {cuota_word} por 92 libros)</b>\n"
         f"• Distribución: {dist_line}\n"
-        f"• {best_icon} Máximo del ciclo: <b>{best['roi']:+.1%}</b> en <b>{esc(best['juego'])}</b> ({esc(best['sport'])}) → {esc(best['pick'])} @ {best['cuota_am']}"
+        f"• {best_icon} Máximo del ciclo: <b>{best['roi']:+.1%}</b> (Prob. estimada: <b>{best['p_ref']:.1%}</b>) en <b>{esc(best['juego'])}</b> ({esc(best['sport'])}) → {esc(best['pick'])} @ {best['cuota_am']}"
     )
 
 
@@ -522,7 +522,7 @@ def calc_metrics_and_kelly(p_cond: float, decimal_odds: float, q_push: float = 0
 
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Faltan credenciales de Telegram.")
+        print("Faltan credenciales de Telegram (TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID).")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
@@ -542,20 +542,25 @@ def send_telegram(message: str) -> bool:
             print(f"Telegram respondió ok=False: {resp}")
             return False
         except urllib.error.HTTPError as e:
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
             if e.code == 429:
                 retry_after = 5
                 try:
-                    body = json.loads(e.read().decode("utf-8"))
+                    body = json.loads(err_body)
                     retry_after = int(body.get("parameters", {}).get("retry_after", 5))
                 except Exception:
                     pass
                 time.sleep(min(30, retry_after) + 0.5)
                 continue
-            print(f"Error Telegram HTTP {e.code}")
+            print(f"Error Telegram HTTP {e.code}: {err_body}")
             return False
         except Exception as e:
             if attempt == 2:
-                print(f"Error Telegram ({type(e).__name__})")
+                print(f"Error Telegram ({type(e).__name__}): {e}")
                 return False
             time.sleep(1.5 * (attempt + 1))
     return False
@@ -998,16 +1003,6 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                 STATE["rag_blocked"] += 1
                 continue
 
-            cycle_hits.append({
-                "juego": juego_str,
-                "sport": sport,
-                "pick": f"{mkey.upper()} → {o['name']}{linea_str}",
-                "cuota_am": cuota_am,
-                "roi": roi,
-                "tier_code": tier_code,
-                "is_alt": alt_delta > 0,
-            })
-
             if roi > STATE["max_roi_seen"]:
                 STATE["max_roi_seen"] = round(roi, 4)
 
@@ -1066,6 +1061,16 @@ def scan_event(sport: str, ev: dict, now_utc: datetime, cycle_hits: list):
                 STATE["alerts_sent"] += 1
                 if alt_delta > 0:
                     STATE["alt_line_alerts"] += 1
+                cycle_hits.append({
+                    "juego": juego_str,
+                    "sport": sport,
+                    "pick": f"{mkey.upper()} → {o['name']}{linea_str}",
+                    "cuota_am": cuota_am,
+                    "p_ref": p_est,
+                    "roi": roi,
+                    "tier_code": tier_code,
+                    "is_alt": alt_delta > 0,
+                })
 
 
 def heartbeat():
@@ -1183,6 +1188,8 @@ def monitored_wait(seconds: int):
 
 
 def scanner_loop():
+    global API_BLOCK_UNTIL
+    API_BLOCK_UNTIL = 0.0
     mode_now, _ = get_schedule_profile(datetime.now(timezone.utc))
     send_telegram(
         f"🚀 <b>Real Harvest Radar V3.3 ÉLITE</b> activo\n"
